@@ -1,4 +1,5 @@
 # Drama: Mamba-Enabled Model-Based Reinforcement Learning Is Sample and Parameter Efficient
+# Upgrading Drama for better generalization - publishing soon
 
 This repository provides an implementation of [Drama](https://openreview.net/forum?id=7XIkRgYjK3&nesting=2&sort=date-desc): a Mamba/Mamba2 powered model based reinforcement learning agent.
 
