@@ -7,10 +7,11 @@ import torch.functional as F
 from networks import MLP, SparseCodebookMoE
 
 class MoETransitionHead(nn.Module):
-    def __init__(self, hidden_dim, code_dim, num_codes, conf_dim):
+    def __init__(self, hidden_state_dim, hidden_dim, code_dim, num_codes, conf_dim, num_experts: int = 8):
         super().__init__()
-        self.moe = SparseCodebookMoE(num_experts=8, hidden_dim=hidden_dim, code_dim=code_dim)
+        self.moe = SparseCodebookMoE(num_experts=num_experts, hidden_dim=hidden_dim, code_dim=code_dim)
         self.conf_mask = nn.Parameter(torch.zeros(hidden_dim))
+        self.hidden_state_dim = hidden_state_dim
         self.f_conf = nn.Sequential(
             nn.Linear(conf_dim, hidden_dim),
             nn.ReLU(),
@@ -37,7 +38,7 @@ class MoETransitionHead(nn.Module):
 
         # Projection layer for H modulation
         self.proj_w = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(hidden_state_dim, hidden_dim),
         nn.ReLU()    # Matches F.relu in forward
         )
         nn.init.orthogonal_(self.proj_w[0].weight)
@@ -153,14 +154,14 @@ class RewardHead(nn.Module):
         return scaled_reward
 
 class ImprovedRewardHead(RewardHead):
-    def __init__(self, num_codes, code_dim, hidden_dim=256, world_dim=512):
+    def __init__(self, num_codes, code_dim, hidden_state_dim, num_heads=4, hidden_dim=256):
         super().__init__(num_codes, code_dim, hidden_dim)
 
         # For the h_modulated
-        self.state_proj = nn.Sequential(nn.Linear(world_dim, code_dim),
+        self.state_proj = nn.Sequential(nn.Linear(hidden_state_dim, code_dim),
                                         nn.SiLU())
         # Cross-codebook attention
-        self.attn = nn.MultiheadAttention(embed_dim=code_dim*2, num_heads=4,
+        self.attn = nn.MultiheadAttention(embed_dim=code_dim*2, num_heads=num_heads,
                                           kdim=code_dim, vdim=code_dim)
 
         self.code_align = nn.Linear(code_dim, code_dim, bias=False)
@@ -168,17 +169,17 @@ class ImprovedRewardHead(RewardHead):
 
         # Learnable bins with modulated scaling
         self.bin_centers = nn.Parameter(torch.linspace(-10,10,255)) # Learnable
-        self.bin_scaler = nn.Sequential(nn.Linear(world_dim, 255),
+        self.bin_scaler = nn.Sequential(nn.Linear(hidden_state_dim, 255),
                                         nn.Sigmoid())
 
-    def forward(self, h, code_emb, q_re):
+    def forward(self, h_modulated, code_emb, q_re):
         """
         h_modulated: [B,T,D_w] - modulated state from transition head
         code_emb: [B,T,D_c] - quantized reward codes
         q_re: [B,T,K] - code weights
         """
         # Project modulated state to code space
-        h_modulated = h.detach()  # Avoid flowing into the world model
+        h_modulated = h_modulated.detach()  # Avoid flowing into the world model
         state_proj = self.state_proj(h_modulated) # [B, T, D_c]
 
         # Create attention query from state-code fusion

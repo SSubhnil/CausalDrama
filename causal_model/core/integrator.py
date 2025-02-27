@@ -5,9 +5,9 @@ import torch.nn.init as init
 import torch.functional as F
 
 from causal_model.core.networks import SparseCodebookMoE
-from encoder import CausalEncoder, CausalEncoder_Confounder, CausalDecoder
+from encoder import CausalEncoder, CausalEncoder
 from quantizer import DualVQQuantizer
-from confounder_approx import ConfounderApproximator
+from confounder_approx import ConfounderPosterior, ConfounderPrior
 from predictors import MoETransitionHead, RewardHead, ImprovedRewardHead
 from networks import SparseCodebookMoE
 
@@ -17,7 +17,6 @@ class CausalModel(nn.Module):
         super().__init__()
         self.hidden_state_dim = params.Models.WorldModel.HiddenStateDim
         self.code_dim = params.Models.CausalModel.CodeDim
-        self.conf_dim = params.Models.CausalModel.ConfDim
         self.num_codes_tr = params.Models.CausalModel.NumCodesTr
         self.num_codes_re = params.Models.CausalModel.NumCodesRe
         self.hidden_dim = params.Models.CausalModel.HiddenDim
@@ -27,11 +26,15 @@ class CausalModel(nn.Module):
         self.inv_weight = params.Models.CausalModel.InvarianceWeight
         self.sparsity_weight = params.Models.CausalModel.SparsityWeight
         self.use_confounder = params.Models.CausalModel.UseConfounder
-        self.device= device
+        self.device = device
 
 
         """Encoder"""
-        self.encoder = self.create_causal_encoder(self.params)
+        self.encoder_params = params.Models.CausalModel.Encoder
+        self.causal_encoder = CausalEncoder(hidden_state_dim=self.hidden_state_dim,
+                                     tr_proj_dim=self.encoder_params.TransProjDim,
+                                     re_proj_dim=self.encoder_params.RewProjDim,
+                                     hidden_dim=self.encoder_params.HiddenDim)
 
         """Quantizer"""
         self.quantizer_params = params.Models.CausalModel.Quantizer
@@ -46,23 +49,32 @@ class CausalModel(nn.Module):
                                          hidden_dim=self.hidden_dim)
 
         """Confounder Inference"""
-        self.confounder_net = ConfounderApproximator(code_dim=params.code_dim,
-                                                     conf_dim=params.conf_dim,
-                                                     num_codes=params.num_codes_tr,
-                                                     params=self.params)
-        self.tr_predictor = MoETransitionHead
+        self.confounder_params = params.Models.CausalModel.Confounder
+        self.confounder_prior_net = ConfounderPrior(num_codes=self.num_codes_tr,
+                                                    code_dim=self.code_dim,
+                                                    conf_dim=self.confounder_params.ConfDim,
+                                                    hidden_state_proj_dim=self.encoder_params.TransProjDim,
+                                                    momentum=self.confounder_params.PriorMomentum)
+        self.confounder_post_net = ConfounderPosterior(code_dim=self.code_dim,
+                                                       conf_dim=self.confounder_params.ConfDim,
+                                                       num_codes=self.num_codes_tr,
+                                                       hidden_dim=self.confounder_params.HiddenDim)
+        """Predictor Heads"""
+        self.predictor_params = self.params.Models.CausalModel.Predictors
+        self.tr_head = MoETransitionHead(hidden_state_dim=self.hidden_state_dim,
+                                              hidden_dim=self.predictor_params.Transition.HiddenDim,
+                                              code_dim=self.code_dim,
+                                              num_codes=self.num_codes_tr,
+                                              conf_dim=self.confounder_params.ConfDim,
+                                              num_experts=self.predictor_params.Transition.NumOfExperts)
 
-        # Simplified data flow
-        # h_modulated = modulator(h_world, codes_u)  # Feature adaptation
-        # moe_out = SparseCodebookMoE(h_modulated, code_emb)  # Mechanism selection
+        self.re_head = ImprovedRewardHead(num_codes=self.num_codes_re,
+                                          code_dim=self.code_dim,
+                                          hidden_dim=self.predictor_params.Reward.HiddenDim,
+                                          hidden_state_dim=self.hidden_state_dim,
+                                          num_heads=self.predictor_params.Reward.NumHeads)
 
-        # In MoETransitionHead:
-        # h_modulated = h_modulated.detach()  # Stop gradient to world model
 
-        # In Quantizer:
-        # quantized_re = quantized_re.detach()  # Protect codebook
-
-        # Hidden state modulation network
 
     def forward(self, h, q):
         enc_output = self.encoder(h)
@@ -81,11 +93,4 @@ class CausalModel(nn.Module):
 
         return next_h, enc_output
 
-    def create_causal_encoder(self, params):
-        if self.use_confounder:
-            return CausalEncoder_Confounder(params)
-        return CausalEncoder(params)
-
-    def create_causal_decoder(self, params):
-        return CausalDecoder(params, use_confounder=params.use_confounder)
 

@@ -103,7 +103,6 @@ Models:
   CausalModel:
     dtype: float32
     CodeDim: 64               # Dimension of codebook entries
-    ConfDim: 32               # Confounder dimension
     NumCodesTr: 128           # Transition codebook size
     NumCodesRe: 64          # Reward codebook size
     HiddenDim: 256            # Hidden dimension for MLPs
@@ -113,6 +112,13 @@ Models:
     InvarianceWeight: 0.3     # Mechanism invariance loss
     SparsityWeight: 0.1       # Mask sparsity regularization
     UseConfounder: False      # Flag to use confounder encoder and approximator
+
+    Encoder:
+      TransProjDim: 256 # Dim of projection of h into transition continuous embeddings
+      RewProjDim: 256 # Dim of projection of h into reward continuous embeddings
+      HiddenDim: 512 # Hidden layer dimensions
+      Activation: SiLU # Activation function
+
 
     Quantizer:
       Temperature: 1.0        # Initial Gumbel softmax temp
@@ -125,12 +131,14 @@ Models:
       UseCDist: False
 
     Confounder:
-      COnfDim:
+      ConfDim: 128            # Confounder Dimensions
+      HiddenDim: 512          # Hidden layer dimensions
       PriorLayers: 2          # MLP layers for prior network
       PostLayers: 2           # MLP layers for posterior
       AffineInitStd: 0.01     # Affine param initialization
       MinLogVar: -6.0         # Posterior variance bounds
       MaxLogVar: 0.0
+      PriorMomentum: 0.97
 
     Modulation:
       MaskInitScale: 0.5      # Initial scale for modulation
@@ -140,8 +148,12 @@ Models:
 
     Predictors:
       Transition:
+        NumOfExperts: 8
+        HiddenDim: 512
 
       Reward:
+        HiddenDim: 256
+        NumHeads: 4
 
       Termination:
 
