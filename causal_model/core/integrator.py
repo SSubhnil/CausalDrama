@@ -82,16 +82,15 @@ class CausalModel(nn.Module):
 
 
 
-    def forward(self, h, q):
-        enc_output = self.encoder(h)
+    def forward(self, h):
+        # Projection of raw hidden state into h_tr and h_re
+         h_proj_tr, h_proj_re = self.causal_encoder(h)
+
+
+
         # Get soft code assignments
         code_ids = torch.argmax(q, dim=1)  # Differentiable via Gumbel-STG
         u, kl_loss = ConfounderApproximator(h, code_ids)  # [B, conf_dim]
-
-        next_h =  self.decoder(enc_output['tr_features'],
-                               enc_output['re_features'],
-                               enc_output.get('confounder_sample')
-                               )
 
         # Reward prediction integration
         # quant_out = self.quantizer(h_tr, h_re)

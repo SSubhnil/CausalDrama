@@ -21,4 +21,4 @@ class CausalEncoder(nn.Module):
 
     def forward(self, h):
         # Extract Features
-        return {'tr_features': self.tr_proj(h), 're_features': self.re_proj(h)}
+        return self.tr_proj(h), self.re_proj(h)

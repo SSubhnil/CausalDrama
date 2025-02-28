@@ -141,11 +141,11 @@ class DualVQQuantizer(nn.Module):
         total_loss = quant_loss_tr + quant_loss_re
 
         output_dict = {
-            'q_tr': q_tr,
-            'soft_tr': soft_tr,
-            'hard_tr': hard_tr,
-            'quantized_tr': quantized_tr,
-            'q_re': q_re,
+            'q_tr': q_tr,                       # Soft assignments [B, T, KTr]
+            'soft_tr': soft_tr,                 # Soft codes [B, T, D]
+            'hard_tr': hard_tr,                 # Hard codes (indices) [B, T]
+            'quantized_tr': quantized_tr,       # Straight-through codes [B, T, D]
+            'q_re': q_re,                       # Same for reward branch
             'soft_re': soft_re,
             'hard_re': hard_re,
             'quantized_re': quantized_re,
