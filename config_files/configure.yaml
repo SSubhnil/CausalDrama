@@ -113,17 +113,19 @@ Models:
     SparsityWeight: 0.1       # Mask sparsity regularization
     UseConfounder: False      # Flag to use confounder encoder and approximator
 
-    Encoder:
-      TransProjDim: 256 # Dim of projection of h into transition continuous embeddings
-      RewProjDim: 256 # Dim of projection of h into reward continuous embeddings
-      HiddenDim: 512 # Hidden layer dimensions
-      Activation: SiLU # Activation function
-
+    Encoder:                  # Avoid bottlenecking -> hidden_dim == hidden_state_dim
+      TransProjDim: 256       # Dim of projection of h into transition continuous embeddings
+      RewProjDim: 128         # Dim of projection of h into reward continuous embeddings
+      HiddenDim: 512          # Hidden layer dimensions
+      Activation: SiLU        # Activation function
 
     Quantizer:
-      Temperature: 1.0        # Initial Gumbel softmax temp
-      AnnealFactor: 0.95      # Temp decay per update
-      MinTemperature: 0.1     # Lower temperature bound
+      TransitionTemp: 1.0     # Initial Gumbel softmax temp for transition codebook
+      RewardTemp: 1.0         # Initial Gumbel softmax temp for transition codebook
+      TransitionMinTemperature: 0.1     # Lower temperature bound for transition codebook
+      RewardMinTemperature: 0.1     # Lower temperature bound for reward codebook
+      TransitionAnnealFactor: 0.97      # Temp decay per update for transition codebook
+      RewardAnnealFactor: 0.95          # Temp decay per update for reward codebook
       Beta: 0.25              # Commitment loss weight
       NormalizedInputs: True  # L2 normalize inputs/codebook
       Coupling: True          # Enable codebook coupling
