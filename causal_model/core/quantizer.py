@@ -17,12 +17,13 @@ class VQQuantizer(nn.Module):
     - A quantization loss to update the codebook
     """
     def __init__(self, num_codes: int, code_dim: int, beta: float = 0.25,
-                 temperature: float = 1.0, use_cdist: bool = False, normalize: bool = False):
+                 initial_temp: float = 1.0, use_cdist: bool = False, normalize: bool = False):
         super().__init__()
+        self.initial_temp = initial_temp # Track base temperature
+        self.temperature = initial_temp # Active temperature
         self.num_codes = num_codes
         self.code_dim = code_dim
         self.beta = beta
-        self.temperature = temperature
         self.use_cdist = use_cdist
         # When True, codebook vectors reside on the unit sphere
         # Ensures cosine similarity calculation are equivalent to L2 distance when inputs are normalized
@@ -82,12 +83,6 @@ class VQQuantizer(nn.Module):
 
         return q, c_tilde, c_hard, c_quantized, loss
 
-    def anneal_temperature(self, factor: float, min_temp=0.01):
-        """
-        Anneals the temperature by multiplying it by a factor (< 1 to reduce temperature).
-        """
-        self.temperature *= max(self.temperature * factor, min_temp)
-
     def set_temperature(self, new_temp: float):
         """
         Sets temperature to a new value
@@ -103,16 +98,31 @@ class DualVQQuantizer(nn.Module):
         - One for reward branch
         - (Optional) Coupling loss between two branches
     """
-    def __init__(self, code_dim: int, num_codes_tr: int, num_codes_re: int, beta: float = 0.25,
-                 temperature: float = 1.0, use_cdist: bool = False, normalize: bool = False,
-                 coupling: bool = False, lambda_couple: float = 0.1, hidden_dim: int = 128):
+    def __init__(self, code_dim: int,
+                 num_codes_tr: int,
+                 num_codes_re: int,
+                 beta: float = 0.25,
+                 tr_temperature: float = 2.0, tr_min_temperature: float = 0.05, tr_anneal_factor: float = 0.97,
+                 re_temperature:float = 1.5, re_min_temperature: float = 0.1, re_anneal_factor: float = 0.95,
+                 use_cdist: bool = False, normalize: bool = False,
+                 coupling: bool = False, lambda_couple: float = 0.1,
+                 hidden_dim: int = 512):
         super().__init__()
+        # Tracking temperature annealing for codebooks
+        self.tr_temperature = tr_temperature
+        self.tr_min_temperature = tr_min_temperature
+        self.re_temperature = re_temperature
+        self.re_min_temperature = re_min_temperature
+        self.tr_factor = tr_anneal_factor
+        self.re_factor = re_anneal_factor
+
         self.tr_quantizer = VQQuantizer(num_codes=num_codes_tr, code_dim=code_dim, beta=beta,
-                                        temperature=temperature, use_cdist=use_cdist, normalize=normalize)
+                                        initial_temp=self.tr_temperature, use_cdist=use_cdist, normalize=normalize)
         self.re_quantizer = VQQuantizer(num_codes=num_codes_re, code_dim=code_dim, beta=beta,
-                                        temperature=temperature, use_cdist=use_cdist, normalize=normalize)
+                                        initial_temp=self.re_temperature, use_cdist=use_cdist, normalize=normalize)
 
         self.coupling = coupling
+
 
         if self.coupling: # Only create coupling components when enabled
             self.coupling_mlp = nn.Sequential(nn.Linear(num_codes_re, hidden_dim), nn.SiLU(),
@@ -170,19 +180,21 @@ class DualVQQuantizer(nn.Module):
         Args:
             epoch (float): Multiplicative factor (< 1 reduces temperature).
         """
-        tr_temp = max(0.1, 1.0*(0.95**epoch)) # Faster annealing
-        re_temp = max(0.2, 1.0*(0.97**epoch)) # Slower reward annealing
-        self.tr_quantizer.set_temperature(tr_temp)
-        self.re_quantizer.set_temperature(re_temp)
-        if self.coupling:
-            self.coupling_mlp[-1].weight.data *= factor
+        tr_temp = max(self.tr_min_temperature, self.tr_temperature * (self.tr_factor ** epoch))
+        re_temp = max(self.re_min_temperature, self.re_temperature * (self.re_factor ** epoch))
 
-    def set_temperature(self, new_temp: float):
+        # update quantizer temperatures
+        self.tr_quantizer.temperature = tr_temp
+        self.re_quantizer.temperature = re_temp
+
+    def set_temperature(self, new_temp: float, which: str = 'both'):
         """
         Sets the temperature for both quantizers to a new value.
 
         Args:
             new_temp (float): New temperature.
         """
-        self.tr_quantizer.set_temperature(new_temp)
-        self.re_quantizer.set_temperature(new_temp)
+        if which == 'both' or which == 'tr':
+            self.tr_quantizer.temperature = new_temp
+        if which == 'both' or which == 're':
+            self.re_quantizer.temperature = new_temp

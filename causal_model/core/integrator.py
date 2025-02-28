@@ -42,11 +42,17 @@ class CausalModel(nn.Module):
                                          num_codes_tr=self.num_codes_tr,
                                          num_codes_re=self.num_codes_re,
                                          beta=self.quantizer_params.Beta,
-                                         temperature=self.quantizer_params.Temperature,
+                                         tr_temperature=self.quantizer_params.TransitionTemp,
+                                         tr_min_temperature=self.quantizer_params.TransitionMinTemperature,
+                                         tr_anneal_factor=self.quantizer_params.TransitionAnnealFactor,
+                                         re_temperature=self.quantizer_params.RewardTemp,
+                                         re_min_temperature=self.quantizer_params.RewardMinTemperature,
+                                         re_anneal_factor=self.quantizer_params.RewardAnnealFactor,
                                          normalize=self.quantizer_params.NormalizedInputs,
                                          coupling=self.quantizer_params.Coupling,
                                          lambda_couple=self.quantizer_params.LambdaCouple,
-                                         hidden_dim=self.hidden_dim)
+                                         hidden_dim=self.hidden_dim,
+                                         )
 
         """Confounder Inference"""
         self.confounder_params = params.Models.CausalModel.Confounder
