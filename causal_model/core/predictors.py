@@ -1,15 +1,11 @@
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.init as init
-import torch.functional as F
-
-from networks import MLP, SparseCodebookMoE
 
 class MoETransitionHead(nn.Module):
-    def __init__(self, hidden_state_dim, hidden_dim, code_dim, num_codes, conf_dim, num_experts: int = 8):
+    def __init__(self, moe_net, hidden_state_dim, hidden_dim, code_dim, conf_dim, num_experts: int = 8):
         super().__init__()
-        self.moe = SparseCodebookMoE(num_experts=num_experts, hidden_dim=hidden_dim, code_dim=code_dim)
+        self.moe = moe_net
         self.conf_mask = nn.Parameter(torch.zeros(hidden_dim))
         self.hidden_state_dim = hidden_state_dim
         self.f_conf = nn.Sequential(

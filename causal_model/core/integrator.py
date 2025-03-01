@@ -67,12 +67,17 @@ class CausalModel(nn.Module):
                                                        hidden_dim=self.confounder_params.HiddenDim)
         """Predictor Heads"""
         self.predictor_params = self.params.Models.CausalModel.Predictors
-        self.tr_head = MoETransitionHead(hidden_state_dim=self.hidden_state_dim,
-                                              hidden_dim=self.predictor_params.Transition.HiddenDim,
-                                              code_dim=self.code_dim,
-                                              num_codes=self.num_codes_tr,
-                                              conf_dim=self.confounder_params.ConfDim,
-                                              num_experts=self.predictor_params.Transition.NumOfExperts)
+        self.moe_net = SparseCodebookMoE(num_experts=self.predictor_params.Transition.NumOfExperts,
+                                         hidden_dim=self.predictor_params.Transition.HiddenDim,
+                                         code_dim=self.code_dim,
+                                         quantizer=self.quantizer,
+                                         top_k=self.predictor_params.Transition.TopK)
+        self.tr_head = MoETransitionHead(moe_net=self.moe_net,
+                                         hidden_state_dim=self.hidden_state_dim,
+                                         hidden_dim=self.predictor_params.Transition.HiddenDim,
+                                         code_dim=self.code_dim,
+                                         conf_dim=self.confounder_params.ConfDim,
+                                         num_experts=self.predictor_params.Transition.NumOfExperts)
 
         self.re_head = ImprovedRewardHead(num_codes=self.num_codes_re,
                                           code_dim=self.code_dim,
@@ -84,13 +89,31 @@ class CausalModel(nn.Module):
 
     def forward(self, h):
         # Projection of raw hidden state into h_tr and h_re
-         h_proj_tr, h_proj_re = self.causal_encoder(h)
+        h_proj_tr, h_proj_re = self.causal_encoder(h)
 
+        # Projections go into Dual Codebook Quantizer
+        quant_output_dict = self.quantizer(h_proj_tr, h_proj_re)
+        code_emb_tr = quant_output_dict['quantized_tr']
 
+        # Confounder approximation with transition codebook
+        # Prior uses EMA codebook entries ('code_emb_momentum') that require discrete indices for lookup.
+        # hard_tr codes ensure prior stability during posterior training (no grad flow to codebook)
+        mu_prior, logvar_prior = self.confounder_prior_net(h_proj_tr,
+                                                           code_ids=quant_output_dict['hard_tr'].argmax(-1)) # Discrete indices [B, T]
 
-        # Get soft code assignments
-        code_ids = torch.argmax(q, dim=1)  # Differentiable via Gumbel-STG
-        u, kl_loss = ConfounderApproximator(h, code_ids)  # [B, conf_dim]
+        u_post, kl_loss = self.confounder_post_net(h_proj_tr, code_emb_tr,
+                                                   mu_prior, logvar_prior)
+
+        # Prediction Heads
+        # Transition prediction
+        next_state
+
+        # For SparseCodebookMoE add periodic sync in training loop (every 100 steps)
+        # def sync_code_anchor(self):
+        #     self.code_anchor.data.copy_(
+        #         quantizer.tr_codebook.weight.data[:num_experts]
+        #     )
+
 
         # Reward prediction integration
         # quant_out = self.quantizer(h_tr, h_re)

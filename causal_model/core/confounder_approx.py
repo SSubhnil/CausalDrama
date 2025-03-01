@@ -70,7 +70,7 @@ class ConfounderPosterior(nn.Module):
         self._eps = torch.finfo(torch.float32).eps
 
 
-    def forward(self, h: torch.Tensor, code_ids: torch.Tensor,mu_prior, logvar_prior):
+    def forward(self, h: torch.Tensor, quantized_tr, mu_prior, logvar_prior):
         """
         Args:
             h: Hidden state from world model [B, D]
@@ -84,7 +84,9 @@ class ConfounderPosterior(nn.Module):
             # Call confounder prior network
 
             # Hypernetwork based posterior
-            code_emb = self.code_embed(code_ids)  # [B, embed_dim]
+            #code_emb = self.code_embed(code_ids)  # [B, embed_dim]
+            # Maintains end-to-end gradient flow from posterior -> codebook (with actual code vectors)
+            code_emb = quantized_tr # [B, T, D] from quantizer
             mu_post = self.confounder_post_mu_net(h, code_emb)
             logvar_post = self.confounder_post_logvar_net(h, code_emb)
 

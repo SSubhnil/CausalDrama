@@ -42,7 +42,8 @@ class SparseCodebookMoE(nn.Module):
         # self.code_anchor = nn.Parameter(torch.num_experts, code_dim)
         # Codebook aligned initialization
         """Handle quantized_Tr in integrator.py"""
-        self.code_anchor.data.copy_(quantizer.quantized_tr.weight.data[:num_experts])
+        self.register_buffer('code_anchor',
+                             quantizer.tr_quantizer.weight.data[:num_experts].clone())
         self.experts = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(hidden_dim + code_dim, 4*hidden_dim),
@@ -51,12 +52,18 @@ class SparseCodebookMoE(nn.Module):
             ) for _ in range(num_experts)
         ])
         self.router = nn.Linear(code_dim, num_experts)
-        self.top_k = max(1, hidden_dim//64) # Dynamic scaling
+        self.top_k = top_k
         self.aux_loss = nn.CrossEntropyLoss()
 
         for expert, anchor in zip(self.experts, self.code_anchor):
             nn.init.normal_(expert[0].weight, mean=anchor[0].item(), std=0.01)
             nn.init.zeros_(expert[-1].weight)
+
+        # Use this for router, if cosine similarity is unstable
+        self.router = nn.Sequential(
+            nn.Linear(code_dim, num_experts, bias=False),
+            nn.LogSoftmax(dim=-1)
+        )
 
     def forward(self, h, code_emb):
         # h: [B, D], code_emb: [B, C]
@@ -65,6 +72,9 @@ class SparseCodebookMoE(nn.Module):
             self.code_anchor.unsqueeze(0), # [1,E,C]
             dim=-1
         ) * 0.125 # Scale for stability
+
+        # The following is cosine similarity is unstable
+        # router_logits = self.router(code_emb)  # [B, E]
         expert_weights = F.gumbel_softmax(router_logits, tau=max(0.1, 0.5*(0.95**epoch)), hard=False) # Should be True for soft routing
 
         # Sparse expert selection
@@ -82,7 +92,7 @@ class SparseCodebookMoE(nn.Module):
         # Load balancing loss
         expert_counts = expert_weights.sum(0)
 
-        # The following encourages equal probability distribution
+        # Google's soft-moe loss
         # expert_probs = expert_counts / expert_counts.sum()
         # aux_loss = (expert_probs * torch.log(expert_probs + 1e-7)).sum()
 

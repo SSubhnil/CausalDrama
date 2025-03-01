@@ -17,7 +17,7 @@ class VQQuantizer(nn.Module):
     - A quantization loss to update the codebook
     """
     def __init__(self, num_codes: int, code_dim: int, beta: float = 0.25,
-                 initial_temp: float = 1.0, use_cdist: bool = False, normalize: bool = False):
+                 initial_temp: float = 1.0, use_cdist: bool = False, normalize: bool = True):
         super().__init__()
         self.initial_temp = initial_temp # Track base temperature
         self.temperature = initial_temp # Active temperature
@@ -32,7 +32,7 @@ class VQQuantizer(nn.Module):
         if self.normalize:
             self.codebook = nn.Parameter(torch.randn(self.num_codes, self.code_dim))
             with torch.no_grad():
-                self.codebook.data = F.normalize(self.codebook.data, p=2, dim=1)
+                self.codebook.data = F.normalize(self.codebook.data, p=2, dim=1) # Unit sphere
 
         else:
             # Initialize the codebook using Kaiming Uniform
@@ -72,6 +72,7 @@ class VQQuantizer(nn.Module):
 
         # Straight-through estimator: use hard code in forward pass but gradients
         # flow through c_tilde
+        """Double check"""
         c_quantized = c_tilde + (c_hard - c_tilde.detach()) # Passed to the encoder(s)
 
         # Stabilized losses
@@ -159,11 +160,13 @@ class DualVQQuantizer(nn.Module):
 
             kl_loss = F.kl_div(p_tr_cond_re, q_tr.detach(), reduction='batchmean',
                                log_target=False)
+            # Questionable reverse KL -> might remove
             reverse_kl = F.kl_div(q_tr.log(), p_tr_cond_re.detach().exp(), reduction='batchmean')
 
+            # May keep KL asymmetrical?
             coupling_loss = (kl_loss + reverse_kl) * self.lambda_couple
             sparsity_loss = self.coupling_mlp.sparsity_mask.abs().mean()
-            total_loss += coupling_loss + 0.01 * sparsity_loss
+            total_loss += coupling_loss + 0.1 * sparsity_loss
 
             output_dict.update({
                 'coupling_loss': coupling_loss,

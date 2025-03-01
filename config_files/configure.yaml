@@ -102,9 +102,9 @@ Models:
 
   CausalModel:
     dtype: float32
-    CodeDim: 64               # Dimension of codebook entries
+    CodeDim: 32               # [16, 24, 32, 64] Dimension of codebook entries
     NumCodesTr: 128           # Transition codebook size
-    NumCodesRe: 64          # Reward codebook size
+    NumCodesRe: 64            # Reward codebook size
     HiddenDim: 256            # Hidden dimension for MLPs
     KLWeight: 0.1             # KL Divergence loss weight
     QuantWeight: 0.5          # Quantization loss weight
@@ -151,6 +151,7 @@ Models:
     Predictors:
       Transition:
         NumOfExperts: 8
+        TopK: 3
         HiddenDim: 512
 
       Reward:
