@@ -146,13 +146,14 @@ Models:
       MaskInitScale: 0.5      # Initial scale for modulation
       MaskSparsity: 0.8       # Target sparsity ratio
       MinScale: 0.1           # Clamp scale values
-      MaxScale: 1.9           # Uppder clamp scale value
+      MaxScale: 1.9           # Upper clamp scale value
 
     Predictors:
       Transition:
         NumOfExperts: 8
         TopK: 3
         HiddenDim: 512
+        MaskSparsityWeight: 0.05
 
       Reward:
         HiddenDim: 256

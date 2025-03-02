@@ -71,13 +71,14 @@ class CausalModel(nn.Module):
                                          hidden_dim=self.predictor_params.Transition.HiddenDim,
                                          code_dim=self.code_dim,
                                          quantizer=self.quantizer,
-                                         top_k=self.predictor_params.Transition.TopK)
+                                         top_k=self.predictor_params.Transition.TopK,
+                                         )
         self.tr_head = MoETransitionHead(moe_net=self.moe_net,
                                          hidden_state_dim=self.hidden_state_dim,
                                          hidden_dim=self.predictor_params.Transition.HiddenDim,
                                          code_dim=self.code_dim,
                                          conf_dim=self.confounder_params.ConfDim,
-                                         num_experts=self.predictor_params.Transition.NumOfExperts)
+                                         sparsity_weight=self.predictor_params.Transition.MaskSparsityWeight)
 
         self.re_head = ImprovedRewardHead(num_codes=self.num_codes_re,
                                           code_dim=self.code_dim,

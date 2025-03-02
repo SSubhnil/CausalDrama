@@ -3,10 +3,11 @@ import torch
 import torch.nn as nn
 
 class MoETransitionHead(nn.Module):
-    def __init__(self, moe_net, hidden_state_dim, hidden_dim, code_dim, conf_dim, num_experts: int = 8):
+    def __init__(self, moe_net, hidden_state_dim, hidden_dim, code_dim, conf_dim, sparsity_weight):
         super().__init__()
         self.moe = moe_net
         self.conf_mask = nn.Parameter(torch.zeros(hidden_dim))
+        self.sparsity_weight = sparsity_weight
         self.hidden_state_dim = hidden_state_dim
         self.f_conf = nn.Sequential(
             nn.Linear(conf_dim, hidden_dim),
@@ -46,8 +47,9 @@ class MoETransitionHead(nn.Module):
         self.sigma_decay = 0.9995
         self.register_buffer('step', torch.tensor(0))
 
-        # Initialize sparse mask
-        nn.init.bernoulli_(self.conf_mask, p=0.05) # 5% sparse
+        """Replace with learnable sparsity mask"""
+        # Initialize sparse mask - may not be as flexible as a fully learable mask
+        nn.init.normal_(self.conf_mask, std=0.01)
         self.conf_mask.register_hook(lambda grad: grad * (torch.abs(grad) > 0.1).float())
 
     def forward(self, h, code_emb, u):
@@ -81,8 +83,9 @@ class MoETransitionHead(nn.Module):
         modulation_input = torch.cat([code_emb, u], dim=-1)
 
         # Generate scale/shift with gradient gates
-        scale = self.scale_mlp(modulation_input.detach()) # Detach world model
-        shift = self.shift_mlp(modulation_input.detach())
+        """May not be a good idea to detach here"""
+        scale = self.scale_mlp(modulation_input) # Detach world model
+        shift = self.shift_mlp(modulation_input)
 
         # Detach world model gradients
         # h = h.detach()  # Critical stability measure
@@ -98,7 +101,9 @@ class MoETransitionHead(nn.Module):
         # Shared computation
         moe_out, aux_loss = self.moe(h_modulated, code_emb)
 
-        conf_effect = self.f_conf(u) * (self.conf_mask > 0).float()
+        conf_effect = self.f_conf(u) * torch.sigmoid(self.conf_mask)
+
+        sparsity_loss = self.sparsity_weight * torch.mean(torch.abs(self.conf_mask))
 
         conf_effect = conf_effect + (conf_effect.detach() - conf_effect).detach()
 
@@ -186,7 +191,7 @@ class ImprovedRewardHead(RewardHead):
                                 key=self.code_align(code_emb).transpose(0,1),
                                 value=code_emb.transpose(0,1))
 
-        attn_out = attn_out.trnaspose(0,1)  # [B, T, D_c]
+        attn_out = attn_out.transpose(0,1)  # [B, T, D_c]
 
         # State-adaptive bin scaling
         scale = self.bin_scalar(h_modulated) # [B, T, 255]

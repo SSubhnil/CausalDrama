@@ -84,7 +84,7 @@ class SparseCodebookMoE(nn.Module):
 
         # Expert computation
         expert_input = torch.cat([h, code_emb], dim=-1)
-        moe_out = torch.stack([expert(expert_input) for expert in self.experts], dim=1)
+        moe_out = torch.stack([expert(expert_input) for expert in self.experts], dim=1) # Combine
 
         # Weighted sum
         output = torch.einsum('be,bed->bd', expert_weights, moe_out)
