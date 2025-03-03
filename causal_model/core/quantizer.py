@@ -164,7 +164,7 @@ class DualVQQuantizer(nn.Module):
             # reverse_kl = F.kl_div(q_tr.log(), p_tr_cond_re.detach().exp(), reduction='batchmean')
 
             # May keep KL asymmetrical?
-            coupling_loss = (kl_loss + reverse_kl) * self.lambda_couple
+            coupling_loss = kl_loss * self.lambda_couple
             sparsity_loss = self.coupling_mlp.sparsity_mask.abs().mean()
             total_loss += coupling_loss + 0.1 * sparsity_loss
 

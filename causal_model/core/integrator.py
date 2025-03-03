@@ -91,6 +91,7 @@ class CausalModel(nn.Module):
                                                act=self.predictor_params.Termination.Activation,
                                                layer_num=self.predictor_params.Termination.NumLayers,
                                                dropout=self.predictor_params.Termination.Dropout,
+                                               dtype=params.Models.WorldModel.dtype,
                                                device=self.device)
 
 

@@ -328,7 +328,7 @@ class WorldModel(nn.Module):
             categorical_dim=self.categorical_dim,
             class_dim=self.class_dim,
             unimix_ratio=config.Models.WorldModel.Unimix_ratio,
-            tr_predictor = self.causal_model.tr_predictor,
+            tr_predictor = self.causal_model.tr_head,
             dtype=config.Models.WorldModel.dtype, device=device
         )      
         self.image_decoder = Decoder(
@@ -345,25 +345,27 @@ class WorldModel(nn.Module):
             cnn_sigmoid=config.Models.WorldModel.Decoder.FinalLayerSigmoid,
             dtype=config.Models.WorldModel.dtype, device=device
         )
-        
-        self.reward_decoder = RewardHead(
-            num_classes=255,
-            inp_dim=self.hidden_state_dim,
-            hidden_units=config.Models.WorldModel.Reward.HiddenUnits,
-            act=config.Models.WorldModel.Act,
-            layer_num=config.Models.WorldModel.Reward.LayerNum,
-            dtype=config.Models.WorldModel.dtype, device=device
-        )
-        self.reward_decoder.apply(weight_init)
-        self.termination_decoder = TerminationHead(
-            inp_dim=self.hidden_state_dim,
-            hidden_units=config.Models.WorldModel.Termination.HiddenUnits,
-            act=config.Models.WorldModel.Act,
-            layer_num=config.Models.WorldModel.Termination.LayerNum,
-            dtype=config.Models.WorldModel.dtype, device=device
-        )
-        self.termination_decoder.apply(weight_init)
- 
+
+        self.reward_decoder = self.causal_model.re_head
+        self.termination_decoder = self.causal_model.terminator
+        # self.reward_decoder = RewardHead(
+        #     num_classes=255,
+        #     inp_dim=self.hidden_state_dim,
+        #     hidden_units=config.Models.WorldModel.Reward.HiddenUnits,
+        #     act=config.Models.WorldModel.Act,
+        #     layer_num=config.Models.WorldModel.Reward.LayerNum,
+        #     dtype=config.Models.WorldModel.dtype, device=device
+        # )
+        # self.reward_decoder.apply(weight_init)
+        # self.termination_decoder = TerminationHead(
+        #     inp_dim=self.hidden_state_dim,
+        #     hidden_units=config.Models.WorldModel.Termination.HiddenUnits,
+        #     act=config.Models.WorldModel.Act,
+        #     layer_num=config.Models.WorldModel.Termination.LayerNum,
+        #     dtype=config.Models.WorldModel.dtype, device=device
+        # )
+        # self.termination_decoder.apply(weight_init)
+        #
         self.mse_loss_func = MSELoss()
         self.ce_loss = nn.CrossEntropyLoss()
         self.bce_with_logits_loss_func = nn.BCEWithLogitsLoss()
