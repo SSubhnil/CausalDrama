@@ -160,6 +160,10 @@ Models:
         NumHeads: 4
 
       Termination:
+        HiddenDim: 512
+        Activation: SiLU
+        NumLayers: 2
+        Dropout: 0.1
 
     Integration:
       GradDetachWorld: True   # Detach world model gradients

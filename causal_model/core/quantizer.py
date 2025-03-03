@@ -73,7 +73,7 @@ class VQQuantizer(nn.Module):
         # Straight-through estimator: use hard code in forward pass but gradients
         # flow through c_tilde
         """Double check"""
-        c_quantized = c_tilde + (c_hard - c_tilde.detach()) # Passed to the encoder(s)
+        c_quantized = c_tilde + (c_hard - c_tilde.detach())
 
         # Stabilized losses
         codebook_loss = F.mse_loss(h.detach(), c_tilde) # Pulls codebook to embedded h
@@ -161,7 +161,7 @@ class DualVQQuantizer(nn.Module):
             kl_loss = F.kl_div(p_tr_cond_re, q_tr.detach(), reduction='batchmean',
                                log_target=False)
             # Questionable reverse KL -> might remove
-            reverse_kl = F.kl_div(q_tr.log(), p_tr_cond_re.detach().exp(), reduction='batchmean')
+            # reverse_kl = F.kl_div(q_tr.log(), p_tr_cond_re.detach().exp(), reduction='batchmean')
 
             # May keep KL asymmetrical?
             coupling_loss = (kl_loss + reverse_kl) * self.lambda_couple

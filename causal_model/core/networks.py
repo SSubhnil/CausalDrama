@@ -48,7 +48,7 @@ class SparseCodebookMoE(nn.Module):
             nn.Sequential(
                 nn.Linear(hidden_dim + code_dim, 4*hidden_dim),
                 nn.GELU(),
-                nn.Linear(4*hidden_dim, hidden_dim)
+                nn.Linear(4*hidden_dim, 1024//num_experts) # Each expert handles a different part of output space
             ) for _ in range(num_experts)
         ])
         self.router = nn.Linear(code_dim, num_experts)
@@ -84,12 +84,21 @@ class SparseCodebookMoE(nn.Module):
 
         # Expert computation
         expert_input = torch.cat([h, code_emb], dim=-1)
-        moe_out = torch.stack([expert(expert_input) for expert in self.experts], dim=1) # Combine
+        expert_outputs = [expert(expert_input) for expert in self.experts] # Combine
 
-        # Weighted sum
-        output = torch.einsum('be,bed->bd', expert_weights, moe_out)
+        # Concatenate according to output partitions
+        batch_size = h.shape[0]
+        full_output = torch.zeros(batch_size, 1024, device=h.device)
 
-        # Load balancing loss
+        for i, (output, weight) in enumerate(zip(expert_outputs, expert_weights.transpose(0, 1))):
+            start_idx = i * (1024 // self.num_experts)
+            end_idx = (i + 1) * (1024 // self.num_experts)
+            full_output[:, start_idx:end_idx] = weight.unsqueeze(1) * output
+
+        assert full_output.shape[-1] == (1024 // self.num_experts), \
+            "Expert output dim mismatch"
+
+        ### Load balancing loss ###
         expert_counts = expert_weights.sum(0)
 
         # Google's soft-moe loss
@@ -100,6 +109,6 @@ class SparseCodebookMoE(nn.Module):
         expert_load = expert_counts / expert_counts.sum()
         aux_loss = 0.5*(expert_counts.std() + expert_load.entropy())
 
-        return output, aux_loss
+        return full_output, aux_loss
 
 

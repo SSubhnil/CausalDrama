@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
-
+import torch.nn.functional as F
 class MoETransitionHead(nn.Module):
     def __init__(self, moe_net, hidden_state_dim, hidden_dim, code_dim, conf_dim, sparsity_weight):
         super().__init__()
@@ -35,11 +35,17 @@ class MoETransitionHead(nn.Module):
 
         # Projection layer for H modulation
         self.proj_w = nn.Sequential(
-            nn.Linear(hidden_state_dim, hidden_dim),
+            nn.Linear(hidden_state_dim, hidden_state_dim),
         nn.ReLU()    # Matches F.relu in forward
         )
         nn.init.orthogonal_(self.proj_w[0].weight)
         nn.init.normal_(self.proj_w[0].bias, std=1e-6)
+
+        # Final Projection layer to Next-state logits
+        # Output from SparseCodebookMoE is a 1024 projection, but not logits
+        self.final_proj = nn.Sequential(nn.Linear(1024, 1024),
+                                        nn.LogSoftmax(dim=-1) # For categorical latent
+                                        )
 
         # Sigma annealing parameters
         self.sigma = nn.Parameter(torch.tensor(0.3), requires_grad=False)
@@ -56,13 +62,16 @@ class MoETransitionHead(nn.Module):
         """
         total_loss = pred_loss + 0.01*aux_loss + 0.1*conf_sparsity
         """
-        clean_out, aux_loss = self._forward_impl(h, code_emb, u)
+        clean_out, h_modulated, aux_loss, sparsity_loss = self._forward_impl(h, code_emb, u)
+
+        total_loss = aux_loss + sparsity_loss
 
         # Annealed noise injection
         if self.training:
-            noise = torch.randn.like(h) * self.sigma
-            perturbed_out, _ = self._forward_impl(h + noise, code_emb, u)
+            noise = torch.randn_like(h) * self.sigma
+            perturbed_out, _, _, _ = self._forward_impl(h + noise, code_emb, u)
             inv_loss = (clean_out - perturbed_out).pow(2).mean() / (clean_out.deatch().pow(2).mean() + 1e-7)
+            total_loss += inv_loss
 
             # Update sigma
             self.step += 1
@@ -76,7 +85,12 @@ class MoETransitionHead(nn.Module):
             #     self.sigma - (0.3-self.sigma_min)/total_steps
             # )
 
-        return clean_out, aux_loss + inv_loss
+        next_state_logits = self.final_proj(clean_out)  # [B, 1024]
+
+        assert next_state_logits.shape[-1] == 1024, \
+            f"Prediction head output dim {next_state_logits.shape[-1]} != 1024"
+
+        return next_state_logits, h_modulated, total_loss
 
     def _forward_impl(self, h, code_emb, u):
         # Concatenate code and confounder
@@ -86,13 +100,6 @@ class MoETransitionHead(nn.Module):
         """May not be a good idea to detach here"""
         scale = self.scale_mlp(modulation_input) # Detach world model
         shift = self.shift_mlp(modulation_input)
-
-        # Detach world model gradients
-        # h = h.detach()  # Critical stability measure
-
-        # Straight-through estimator for modulation
-        # scale = scale + (scale.detach() - scale).detach()
-        # shift = shift + (shift.detach() - shift).detach()
 
         # Modulated hidden state
         h_transformed = self.proj_w(h) # W from doc
@@ -105,11 +112,9 @@ class MoETransitionHead(nn.Module):
 
         sparsity_loss = self.sparsity_weight * torch.mean(torch.abs(self.conf_mask))
 
-        conf_effect = conf_effect + (conf_effect.detach() - conf_effect).detach()
-
         output = moe_out * (1 - self.conf_mask.sigmoid()) + conf_effect
 
-        return output, aux_loss ################################ TO figure
+        return output, h_modulated, aux_loss, sparsity_loss
 
     # def training_step(self, batch):
     #     h, codes, u = batch
@@ -180,7 +185,8 @@ class ImprovedRewardHead(RewardHead):
         q_re: [B,T,K] - code weights
         """
         # Project modulated state to code space
-        h_modulated = h_modulated.detach()  # Avoid flowing into the world model
+        # h_modulated = h_modulated.detach() # Avoids gradient flow into world model,
+                                             # but the world model may fail to learn.
         state_proj = self.state_proj(h_modulated) # [B, T, D_c]
 
         # Create attention query from state-code fusion
@@ -197,17 +203,65 @@ class ImprovedRewardHead(RewardHead):
         scale = self.bin_scalar(h_modulated) # [B, T, 255]
         scaled_bins = self.bin_centers * scale
 
+
+
         # Code-dependent logits
         logits = self.mlp(attn_out) # [B, T, 255]
         return (logits.softmax(-1) * scaled_bins).sum(-1) # Differentiable bins
 
         # Add to loss function
-        # align_loss = F.mse_loss(
-        #     reward_head.code_align.weight,
-        #     quantizer.tr_codebook.weight[:code_dim]
-        # )
+        #
         # total_loss += 0.05 * align_loss
 
-# Fallback mechanism
-if moe_failure:
-    output = 0.5*moe_out + 0.5*linear_fallback(h) # Ensures graceful degradation
+class TerminationPredictor(nn.Module):
+    def __init__(self, hidden_state_dim, hidden_units, act='SiLU', layer_num=2,
+                 dropout=0.1, dtype=None, device=None):
+        super().__init__()
+        act_fn = getattr(nn, act)
+
+        # Optional hidden state projection (if dimensions need adjustment)
+        self.h_proj = nn.Sequential(nn.Linear(hidden_state_dim,
+                                              hidden_units),
+                                    nn.LayerNorm(hidden_units) # Normalization for stability
+                                    )
+
+        # Create a backbone with dynamic number of layers
+        layers = []
+        for i in range(layer_num):
+            inp_dim = hidden_units if i > 0 else hidden_units
+            layers.append(nn.Linear(inp_dim, hidden_units, bias=True, dtype=dtype,
+                                    device=device))
+            # Using LayerNorm instead of RMSNorm for compatibility
+            layers.append(nn.LayerNorm(hidden_units, dtype=dtype))
+            layers.append(act_fn())
+            layers.append(nn.Dropout(dropout)) # Add dropout for regularization
+
+        self.backbone = nn.Sequential(*layers)
+        self.head = nn.Linear(hidden_units, 1, dtype=dtype, device=device)
+
+        # Initialization
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogoanl_(m.weight, gain=1.0)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, h_modulated):
+        """
+        Args:
+            h_modulated: Modulated hidden state from transition predictor [B, T, Hidden_state_dim]
+
+        Returns:
+            termination: Termination probabilities [B, T]
+        """
+        # Project the modulated hidden state
+        h_proj = self.h_proj(h_modulated)
+
+        # Process h_modulated through  backbone
+        feat = self.backbone(h_proj)
+
+        # Final prediction
+        termination = self.head(feat)
+        termination = termination.squeeze(-1) #  Remove last dimension
+
+        return termination

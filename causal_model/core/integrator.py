@@ -8,7 +8,7 @@ from causal_model.core.networks import SparseCodebookMoE
 from encoder import CausalEncoder, CausalEncoder
 from quantizer import DualVQQuantizer
 from confounder_approx import ConfounderPosterior, ConfounderPrior
-from predictors import MoETransitionHead, RewardHead, ImprovedRewardHead
+from predictors import MoETransitionHead, ImprovedRewardHead, TerminationPredictor
 from networks import SparseCodebookMoE
 
 
@@ -86,6 +86,13 @@ class CausalModel(nn.Module):
                                           hidden_state_dim=self.hidden_state_dim,
                                           num_heads=self.predictor_params.Reward.NumHeads)
 
+        self.terminator = TerminationPredictor(hidden_state_dim=self.hidden_state_dim,
+                                               hidden_units=self.predictor_params.Termination.HiddenDim,
+                                               act=self.predictor_params.Termination.Activation,
+                                               layer_num=self.predictor_params.Termination.NumLayers,
+                                               dropout=self.predictor_params.Termination.Dropout,
+                                               device=self.device)
+
 
 
     def forward(self, h):
@@ -95,6 +102,7 @@ class CausalModel(nn.Module):
         # Projections go into Dual Codebook Quantizer
         quant_output_dict = self.quantizer(h_proj_tr, h_proj_re)
         code_emb_tr = quant_output_dict['quantized_tr']
+        code_emb_re = quant_output_dict['quantized_re']
 
         # Confounder approximation with transition codebook
         # Prior uses EMA codebook entries ('code_emb_momentum') that require discrete indices for lookup.
@@ -107,19 +115,12 @@ class CausalModel(nn.Module):
 
         # Prediction Heads
         # Transition prediction
-        next_state
+        next_state_logits, h_modulated, total_loss = self.tr_head(h, code_emb_tr, u_post)
+        # Reward Prediction
+        reward_pred = self.re_head(h_modulated, code_emb_re, quant_output_dict['q_re'])
+        # Termination head
+        termination = self.terminator(h_modulated)
 
-        # For SparseCodebookMoE add periodic sync in training loop (every 100 steps)
-        # def sync_code_anchor(self):
-        #     self.code_anchor.data.copy_(
-        #         quantizer.tr_codebook.weight.data[:num_experts]
-        #     )
-
-
-        # Reward prediction integration
-        # quant_out = self.quantizer(h_tr, h_re)
-        # reward_pred = self.reward_head(quant_out['quantizedre'], quant_out['q_re'])
-
-        return next_h, enc_output
+        return next_state_logits, reward_pred, termination
 
 
