@@ -130,7 +130,7 @@ def joint_train_world_model_agent(config, logdir,
                     model_context_action = rearrange(torch.Tensor(model_context_action).to(world_model.device), "L -> 1 L")
                     if world_model.model == 'Transformer':
                         prior_flattened_sample, last_dist_feat = world_model.calc_last_dist_feat(context_latent, model_context_action)
-                    elif world_model.model == 'Mamba' or world_model.model == 'Mamba2':
+                    elif world_model.model == 'Mamba' or world_model.model == 'Mamba2': # For PPO or A2C agent
                         prior_flattened_sample, last_dist_feat = world_model.calc_last_dist_feat(context_latent, model_context_action)
                     action = agent.sample_as_env_action(
                         torch.cat([prior_flattened_sample, last_dist_feat], dim=-1),

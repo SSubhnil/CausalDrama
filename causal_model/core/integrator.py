@@ -141,7 +141,6 @@ class CausalModel(nn.Module):
         # Projections go into Dual Codebook Quantizer
         quant_output_dict = self.quantizer(h_proj_tr, h_proj_re)
         code_emb_tr = quant_output_dict['quantized_tr']
-        code_emb_re = quant_output_dict['quantized_re']
         # Quantization Loss Total - loss weights in-code
         quant_loss = quant_output_dict['total_loss']
 
@@ -161,6 +160,9 @@ class CausalModel(nn.Module):
                            (post_l2_reg * self.loss_weights['post_reg']) + \
                            (post_sparsity * self.loss_weights['post_sparsity']) + \
                            (kl_loss * self.loss_weights['kl_loss_weight'])
+        causal_loss = quant_loss + confounder_loss
+
+        return quant_output_dict, u_post, causal_loss
 
         # Prediction Heads
         # Transition prediction
@@ -173,7 +175,9 @@ class CausalModel(nn.Module):
         # Prediction Heads losses
         pred_loss = (self.loss_weights['tr_aux_loss'] * aux_loss) + (self.loss_weights['tr_sparsity_weight'] * sparsity_loss)
 
-        causal_loss = quant_loss + confounder_loss + pred_loss
-        return next_state_logits, reward_pred, termination, causal_loss
+
+        return next_state_logits, reward_pred, termination
+
+
 
 

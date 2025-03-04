@@ -225,7 +225,7 @@ for batch in dataloader:
 
 
 class ConfounderDetector(nn.Module):
-    def __init__(self, causal_model):
+    def __init__(self, causal_model, conf_dim):
         # Shared with causal model
         self.codebook = causal_model.code_emb
         self.register_buffer('residual_mean', torch.zeros(conf_dim))
