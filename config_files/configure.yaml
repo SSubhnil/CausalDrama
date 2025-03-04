@@ -106,11 +106,6 @@ Models:
     NumCodesTr: 128           # Transition codebook size
     NumCodesRe: 64            # Reward codebook size
     HiddenDim: 256            # Hidden dimension for MLPs
-    KLWeight: 0.1             # KL Divergence loss weight
-    QuantWeight: 0.5          # Quantization loss weight
-    RegWeight: 0.01           # Regularization loss weight
-    InvarianceWeight: 0.3     # Mechanism invariance loss
-    SparsityWeight: 0.1       # Mask sparsity regularization
     UseConfounder: False      # Flag to use confounder encoder and approximator
 
     Encoder:                  # Avoid bottlenecking -> hidden_dim == hidden_state_dim
@@ -126,9 +121,11 @@ Models:
       RewardMinTemperature: 0.1     # Lower temperature bound for reward codebook
       TransitionAnnealFactor: 0.97      # Temp decay per update for transition codebook
       RewardAnnealFactor: 0.95          # Temp decay per update for reward codebook
-      Beta: 0.25              # Commitment loss weight
+      BetaTransition: 0.25              # Commitment loss weight for transitions
+      BetaReward: 0.25                  # Commitment loss weight for rewards
       NormalizedInputs: True  # L2 normalize inputs/codebook
       Coupling: True          # Enable codebook coupling
+      SparsityWeight: 0.1     # Sparsity Loss for coupling
       LambdaCouple: 0.1       # Coupling loss weight
       UseCDist: False
 
@@ -141,6 +138,11 @@ Models:
       MinLogVar: -6.0         # Posterior variance bounds
       MaxLogVar: 0.0
       PriorMomentum: 0.97
+      PriorRegWeight: 0.01           # Regularization loss weight
+      PriorCodeAlign: 0.1       # Weight for code alignment loss
+      PostReg: 0.001          # Posterior L2 regularization
+      PostCodeSparsity: 0.01  #
+      PostKLWeight: 0.5
 
     Modulation:
       MaskInitScale: 0.5      # Initial scale for modulation
@@ -149,11 +151,16 @@ Models:
       MaxScale: 1.9           # Upper clamp scale value
 
     Predictors:
+      InvarianceWeight: 0.3     # Mechanism invariance loss
+      TransitionWeight: 1.0 # Main objective - next state prediction
+      RewardWeight: 1.0         # Main objective - reward prediction
+      TerminationWeight: 0.5    # Secondary Objective - episode termination
       Transition:
         NumOfExperts: 8
         TopK: 3
         HiddenDim: 512
         MaskSparsityWeight: 0.05
+        AuxiliaryWeight: 0.1
 
       Reward:
         HiddenDim: 256

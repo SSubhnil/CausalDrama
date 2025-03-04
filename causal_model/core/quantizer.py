@@ -102,11 +102,12 @@ class DualVQQuantizer(nn.Module):
     def __init__(self, code_dim: int,
                  num_codes_tr: int,
                  num_codes_re: int,
-                 beta: float = 0.25,
+                 beta_tr: float = 0.25,
+                 beta_re: float = 0.25,
                  tr_temperature: float = 2.0, tr_min_temperature: float = 0.05, tr_anneal_factor: float = 0.97,
                  re_temperature:float = 1.5, re_min_temperature: float = 0.1, re_anneal_factor: float = 0.95,
                  use_cdist: bool = False, normalize: bool = False,
-                 coupling: bool = False, lambda_couple: float = 0.1,
+                 coupling: bool = False, lambda_couple: float = 0.1, sparsity_weight: float = 0.1,
                  hidden_dim: int = 512):
         super().__init__()
         # Tracking temperature annealing for codebooks
@@ -117,9 +118,9 @@ class DualVQQuantizer(nn.Module):
         self.tr_factor = tr_anneal_factor
         self.re_factor = re_anneal_factor
 
-        self.tr_quantizer = VQQuantizer(num_codes=num_codes_tr, code_dim=code_dim, beta=beta,
+        self.tr_quantizer = VQQuantizer(num_codes=num_codes_tr, code_dim=code_dim, beta=beta_tr,
                                         initial_temp=self.tr_temperature, use_cdist=use_cdist, normalize=normalize)
-        self.re_quantizer = VQQuantizer(num_codes=num_codes_re, code_dim=code_dim, beta=beta,
+        self.re_quantizer = VQQuantizer(num_codes=num_codes_re, code_dim=code_dim, beta=beta_re,
                                         initial_temp=self.re_temperature, use_cdist=use_cdist, normalize=normalize)
 
         self.coupling = coupling
@@ -130,6 +131,7 @@ class DualVQQuantizer(nn.Module):
                                               nn.Linear(hidden_dim, num_codes_tr))
             self.coupling_mlp.register_parameter('sparsity_mask', nn.Parameter(torch.ones_like(self.coupling_mlp[0].weight)))
             self.lambda_couple = lambda_couple
+            self.sparsity_weight = sparsity_weight
 
     def forward(self, h_tr: torch.Tensor, h_re: torch.Tensor):
         """
@@ -166,7 +168,7 @@ class DualVQQuantizer(nn.Module):
             # May keep KL asymmetrical?
             coupling_loss = kl_loss * self.lambda_couple
             sparsity_loss = self.coupling_mlp.sparsity_mask.abs().mean()
-            total_loss += coupling_loss + 0.1 * sparsity_loss
+            total_loss += coupling_loss + self.sparsity_weight * sparsity_loss
 
             output_dict.update({
                 'coupling_loss': coupling_loss,

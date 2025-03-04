@@ -117,7 +117,7 @@ class ConfounderPosterior(nn.Module):
         # Code embedding sparsity
         code_sparsity = torch.mean(torch.abs(self.code_embed.weight))
 
-        return 0.001*l2_reg + 0.01*code_sparsity
+        return l2_reg, code_sparsity
 
     def gaussian_KL(self, mu_post: torch.Tensor, logvar_post: torch.Tensor,
                     mu_prior: torch.Tensor, logvar_prior: torch.Tensor):

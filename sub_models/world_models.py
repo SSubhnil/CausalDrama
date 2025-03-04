@@ -138,7 +138,7 @@ class DistHead(nn.Module):
     '''
     Dist: abbreviation of distribution
     '''
-    def __init__(self, image_feat_dim, hidden_state_dim, categorical_dim, class_dim, unimix_ratio=0.01, tr_predictor, dtype=None, device=None) -> None:
+    def __init__(self, image_feat_dim, hidden_state_dim, categorical_dim, class_dim, tr_predictor, unimix_ratio=0.01, dtype=None, device=None) -> None:
         super().__init__()
         self.stoch_dim = categorical_dim
         self.post_head = nn.Linear(image_feat_dim, categorical_dim*class_dim, dtype=dtype, device=device)
@@ -659,12 +659,18 @@ class WorldModel(nn.Module):
                 dist_feat = self.sequence_model(flattened_sample, action, temporal_mask)
             else:
                 dist_feat = self.sequence_model(flattened_sample, action)
-            prior_logits = self.dist_head.forward_prior(dist_feat)
 
-            # decoding reward and termination with dist_feat
-            reward_hat = self.reward_decoder(dist_feat)
-            termination_hat = self.termination_decoder(dist_feat)
+            """Replace these parts with the causal model"""
+            # Maybe this is how it should be?
+            # Need to add further measures for handling losses
+            prior_logits, reward_hat, termination_hat, causal_loss = self.causal_model(dist_feat)
 
+            # prior_logits = self.dist_head.forward_prior(dist_feat)
+            #
+            # # decoding reward and termination with dist_feat
+            # reward_hat = self.reward_decoder(dist_feat)
+            # termination_hat = self.termination_decoder(dist_feat)
+            """Model losses from causal model"""
             # env loss
             reconstruction_loss = self.mse_loss_func(obs_hat[:batch_size], obs[:batch_size])
             reward_loss = self.symlog_twohot_loss_func(reward_hat, reward)
@@ -672,7 +678,7 @@ class WorldModel(nn.Module):
             # dyn-rep loss
             dynamics_loss, dynamics_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:].detach(), prior_logits[:, :-1])
             representation_loss, representation_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:], prior_logits[:, :-1].detach())
-            total_loss = reconstruction_loss + reward_loss + termination_loss + dynamics_loss + 0.1*representation_loss
+            total_loss = reconstruction_loss + reward_loss + termination_loss + dynamics_loss + 0.1*representation_loss + causal_loss
 
         # gradient descent
         self.scaler.scale(total_loss).backward()

@@ -3,11 +3,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 class MoETransitionHead(nn.Module):
-    def __init__(self, moe_net, hidden_state_dim, hidden_dim, code_dim, conf_dim, sparsity_weight):
+    def __init__(self, moe_net, hidden_state_dim, hidden_dim, code_dim, conf_dim):
         super().__init__()
         self.moe = moe_net
         self.conf_mask = nn.Parameter(torch.zeros(hidden_dim))
-        self.sparsity_weight = sparsity_weight
         self.hidden_state_dim = hidden_state_dim
         self.f_conf = nn.Sequential(
             nn.Linear(conf_dim, hidden_dim),
@@ -90,7 +89,7 @@ class MoETransitionHead(nn.Module):
         assert next_state_logits.shape[-1] == 1024, \
             f"Prediction head output dim {next_state_logits.shape[-1]} != 1024"
 
-        return next_state_logits, h_modulated, total_loss
+        return next_state_logits, h_modulated, total_loss, aux_loss, sparsity_loss
 
     def _forward_impl(self, h, code_emb, u):
         # Concatenate code and confounder
@@ -110,7 +109,7 @@ class MoETransitionHead(nn.Module):
 
         conf_effect = self.f_conf(u) * torch.sigmoid(self.conf_mask)
 
-        sparsity_loss = self.sparsity_weight * torch.mean(torch.abs(self.conf_mask))
+        sparsity_loss = torch.mean(torch.abs(self.conf_mask))
 
         output = moe_out * (1 - self.conf_mask.sigmoid()) + conf_effect
 
