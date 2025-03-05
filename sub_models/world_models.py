@@ -166,10 +166,10 @@ class DistHead(nn.Module):
 
     def forward_prior(self, h, code_emb_tr, u_post):
         # next_state_logits, h_modulated, total_tr_loss, aux_loss, sparsity_loss = self.tr_head(h, code_emb_tr, u_post)
-        logits, h_modulated, total_tr_loss, aux_loss, sparsity_loss = self.prior_head(h, code_emb_tr, u_post)
+        logits, total_tr_loss, aux_loss, sparsity_loss = self.prior_head(h, code_emb_tr, u_post)
         logits = rearrange(logits, "B L (K C) -> B L K C", K=self.stoch_dim)
         logits = self.unimix(logits, self.unimix_ratio)
-        return logits, h_modulated, total_tr_loss, aux_loss, sparsity_loss
+        return logits, total_tr_loss, aux_loss, sparsity_loss
 
 
 
@@ -588,7 +588,9 @@ class WorldModel(nn.Module):
             context_dist_feat = get_hidden_state(context_latent, sample_action, inference_params)
             inference_params.seqlen_offset += context_dist_feat.shape[1]
             quantizer_output, u, _ = self.causal_model(context_dist_feat)
-            context_prior_logits, mod_context_dist_feat, _, _, _ = self.dist_head.forward_prior(context_dist_feat, quantizer_output['hard_tr'], u)
+            mod_context_dist_feat, _ = self.causal_model.state_modulator(context_dist_feat, quantizer_output['hard_tr'],
+                                                                        u)
+            context_prior_logits, _, _, _ = self.dist_head.forward_prior(mod_context_dist_feat, quantizer_output['hard_tr'], u)
             context_prior_sample = self.stright_throught_gradient(context_prior_logits)
             context_flattened_sample = self.flatten_sample(context_prior_sample)
 
@@ -603,7 +605,7 @@ class WorldModel(nn.Module):
                 self.action_buffer[:, i:i+1] = action
                 old_logits_list.append(logits)
                 dist_feat = get_hidden_state(sample_list[-1], action_list[-1], inference_params)
-                _, mod_dist_feat, _, _, _ = self.dist_head.forward_prior(dist_feat, quantizer_output['hard_tr'], u)
+                mod_dist_feat, _ = self.causal_model.state_modulator(dist_feat, quantizer_output['hard_tr'], u)
                 dist_feat_list.append(mod_dist_feat)
                 self.dist_feat_buffer[:, i+1:i+2] = mod_dist_feat
                 inference_params.seqlen_offset += sample_list[-1].shape[1]
@@ -616,7 +618,8 @@ class WorldModel(nn.Module):
                 #     sampled_tokens = sample_tokens(logits, inference_params)
                 #     sequences_cat = torch.cat([sequences_cat, sampled_tokens], dim=1)
                 quantizer_output_x, u_x, _ = self.causal_model(dist_feat_list[-1])
-                prior_logits, mod_dist_feat_list, _, _, _ = self.dist_head.forward_prior(dist_feat_list[-1], quantizer_output_x['hard_tr'], u_x)
+                mod_dist_feat_list, _ = self.causal_model.state_modulator(dist_feat_list[-1], quantizer_output_x['hard_tr'], u_x)
+                prior_logits, _, _, _ = self.dist_head.forward_prior(mod_dist_feat_list[-1], quantizer_output_x['hard_tr'], u_x)
                 prior_sample = self.stright_throught_gradient(prior_logits)
                 prior_flattened_sample = self.flatten_sample(prior_sample)
                 sample_list.append(prior_flattened_sample)
@@ -628,7 +631,7 @@ class WorldModel(nn.Module):
             # action_tensor = torch.cat(action_list, dim=1)
             old_logits_tensor = torch.cat(old_logits_list, dim=1)
 
-            reward_hat_tensor = self.reward_decoder(self.dist_feat_buffer[:,:-1], quantizer_output['hard_re'], quantizer_output['q_re'])
+            reward_hat_tensor, _ = self.reward_decoder(self.dist_feat_buffer[:,:-1], quantizer_output['hard_re'], quantizer_output['q_re'])
             self.reward_hat_buffer = self.symlog_twohot_loss_func.decode(reward_hat_tensor)
             termination_hat_tensor = self.termination_decoder(self.dist_feat_buffer[:,:-1])
             self.termination_hat_buffer = termination_hat_tensor > 0
@@ -668,16 +671,18 @@ class WorldModel(nn.Module):
             """Replace these parts with the causal model"""
             # 1. Pass the dist_feat to the causal model encoder -> quantizer -> confounding
             quantizer_output, u_post, causal_loss = self.causal_model(dist_feat)
+            mod_dist_feat, inv_loss = self.causal_model.state_modulator(dist_feat, quantizer_output['quantized_tr'], u_post)
 
-            prior_logits, h_modulated, total_tr_loss, aux_loss, sparsity_loss = \
-            self.dist_head.forward_prior(dist_feat, quantizer_output['quantized_tr'], u_post)
+            prior_logits, total_tr_loss, aux_loss, sparsity_loss = \
+            self.dist_head.forward_prior(mod_dist_feat, quantizer_output['quantized_tr'], u_post)
 
             # decoding reward and termination with dist_feat
-            reward_hat = self.reward_decoder(h_modulated, quantizer_output['quantized_re'], quantizer_output['q_re'])
-            termination_hat = self.termination_decoder(h_modulated)
+            reward_hat, re_head_loss = self.reward_decoder(mod_dist_feat, quantizer_output['quantized_re'], quantizer_output['q_re'])
+            termination_hat = self.termination_decoder(mod_dist_feat)
 
             """Model losses from causal model"""
             # env loss
+            pred_loss = 0.1 * inv_loss + 0.01 * aux_loss + 0.05 * sparsity_loss
             reconstruction_loss = self.mse_loss_func(obs_hat[:batch_size], obs[:batch_size])
             reward_loss = self.symlog_twohot_loss_func(reward_hat, reward)
             termination_loss = self.bce_with_logits_loss_func(termination_hat, termination)
@@ -686,7 +691,7 @@ class WorldModel(nn.Module):
             #             self.loss_weights['tr_sparsity_weight'] * sparsity_loss)
             dynamics_loss, dynamics_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:].detach(), prior_logits[:, :-1])
             representation_loss, representation_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:], prior_logits[:, :-1].detach())
-            total_loss = reconstruction_loss + reward_loss + termination_loss + dynamics_loss + 0.1*representation_loss + causal_loss
+            total_loss = reconstruction_loss + reward_loss + termination_loss + dynamics_loss + 0.1*representation_loss + causal_loss + pred_loss + re_head_loss
 
         # gradient descent
         self.scaler.scale(total_loss).backward()

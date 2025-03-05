@@ -8,7 +8,7 @@ from causal_model.core.networks import SparseCodebookMoE
 from encoder import CausalEncoder, CausalEncoder
 from quantizer import DualVQQuantizer
 from confounder_approx import ConfounderPosterior, ConfounderPrior
-from predictors import MoETransitionHead, ImprovedRewardHead, TerminationPredictor
+from predictors import MoETransitionHead, ImprovedRewardHead, TerminationPredictor, StateModulator
 from networks import SparseCodebookMoE
 
 
@@ -96,6 +96,7 @@ class CausalModel(nn.Module):
                                                        conf_dim=self.confounder_params.ConfDim,
                                                        num_codes=self.num_codes_tr,
                                                        hidden_dim=self.confounder_params.HiddenDim)
+
         """
         PREDICTOR HEADS
             Transition Head: aux_loss (SparseCodebookMoE), Sparsity Loss
@@ -106,6 +107,8 @@ class CausalModel(nn.Module):
             'tr_aux_loss': self.predictor_params.Transition.AuxiliaryWeight,
             'tr_sparsity_weight': self.predictor_params.Transition.MaskSparsityWeight
         })
+        self.state_modulator = StateModulator(self.hidden_state_dim, self.predictor_params.Transition.HiddenDim,
+                                              self.code_dim, self.confounder_params.ConfDim)
         self.moe_net = SparseCodebookMoE(num_experts=self.predictor_params.Transition.NumOfExperts,
                                          hidden_dim=self.predictor_params.Transition.HiddenDim,
                                          code_dim=self.code_dim,
@@ -117,6 +120,7 @@ class CausalModel(nn.Module):
                                          hidden_dim=self.predictor_params.Transition.HiddenDim,
                                          code_dim=self.code_dim,
                                          conf_dim=self.confounder_params.ConfDim,
+                                         state_modulator=self.state_modulator
                                          )
 
         self.re_head = ImprovedRewardHead(num_codes=self.num_codes_re,
@@ -134,9 +138,13 @@ class CausalModel(nn.Module):
                                                device=self.device)
 
 
-    def forward(self, h):
+    def forward(self, h, detach_encoder=True):
+        if detach_encoder: # Blocks gradient flow from the causal model to world model.
+            h_stable = h.detach()
+        else:
+            h_stable = h
         # Projection of raw hidden state into h_tr and h_re
-        h_proj_tr, h_proj_re = self.causal_encoder(h)
+        h_proj_tr, h_proj_re = self.causal_encoder(h_stable)
 
         # Projections go into Dual Codebook Quantizer
         quant_output_dict = self.quantizer(h_proj_tr, h_proj_re)
@@ -163,21 +171,3 @@ class CausalModel(nn.Module):
         causal_loss = quant_loss + confounder_loss
 
         return quant_output_dict, u_post, causal_loss
-
-        # Prediction Heads
-        # Transition prediction
-        next_state_logits, h_modulated, total_tr_loss, aux_loss, sparsity_loss = self.tr_head(h, code_emb_tr, u_post)
-        # Reward Prediction
-        reward_pred = self.re_head(h_modulated, code_emb_re, quant_output_dict['q_re'])
-        # Termination head
-        termination = self.terminator(h_modulated)
-
-        # Prediction Heads losses
-        pred_loss = (self.loss_weights['tr_aux_loss'] * aux_loss) + (self.loss_weights['tr_sparsity_weight'] * sparsity_loss)
-
-
-        return next_state_logits, reward_pred, termination
-
-
-
-
