@@ -111,4 +111,103 @@ class SparseCodebookMoE(nn.Module):
 
         return full_output, aux_loss
 
+class ImportanceWeightedMoE(nn.Module):
+    def __init__(self, num_experts, hidden_dim, code_dim, quantizer, top_k=2, importance_reg=0.01):
+        super().__init__()
+        # Initialize with your existing code anchors
+        self.register_buffer('code_anchor',
+                            quantizer.tr_quantizer.weight.data[:num_experts].clone())
+        
+        # Feature importance weights for each expert
+        self.feature_importance = nn.Parameter(torch.zeros(num_experts, hidden_dim))
+        # Initialize with slight randomness to break symmetry
+        nn.init.normal_(self.feature_importance, mean=0.0, std=0.01)
+        
+        # Keep your existing expert structure
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden_dim + code_dim, 4*hidden_dim),
+                nn.GELU(),
+                nn.Linear(4*hidden_dim, 1024//num_experts)
+            ) for _ in range(num_experts)
+        ])
+        
+        # Router and other components from your original implementation
+        self.router = nn.Sequential(
+            nn.Linear(code_dim, num_experts, bias=False),
+            nn.LogSoftmax(dim=-1)
+        )
+        self.top_k = top_k
+        self.num_experts = num_experts
+        
+        # Importance regulation parameters
+        self.importance_reg = importance_reg
+        self.importance_temperature = nn.Parameter(torch.tensor(1.0))
+        
+        # Expert initialization (keeping your method)
+        for expert, anchor in zip(self.experts, self.code_anchor):
+            nn.init.normal_(expert[0].weight, mean=anchor[0].item(), std=0.01)
+            nn.init.zeros_(expert[-1].weight)
+
+    def forward(self, h, code_emb):
+        # Router logic (same as your original implementation)
+        router_logits = F.cosine_similarity(
+            code_emb.unsqueeze(1),
+            self.code_anchor.unsqueeze(0),
+            dim=-1
+        ) * 0.125
+        
+        expert_weights = F.gumbel_softmax(router_logits, tau=0.1, hard=False)
+        topk_weights, topk_indices = torch.topk(expert_weights, self.top_k)
+        expert_mask = torch.zeros_like(expert_weights).scatter(1, topk_indices, 1.0)
+        expert_weights = expert_weights * expert_mask
+        
+        # Initialize output
+        batch_size = h.shape[0]
+        full_output = torch.zeros(batch_size, 1024, device=h.device)
+        
+        # Process through experts with importance weighting
+        importance_stats = {'entropy': [], 'mean': [], 'std': []}
+        temperature = torch.clamp(self.importance_temperature, min=0.1, max=5.0)
+        
+        for i, expert in enumerate(self.experts):
+            # Apply temperature-controlled softmax for importance
+            importance = F.softmax(self.feature_importance[i] / temperature, dim=0)
+            
+            # Apply importance weighting - emphasize relevant features
+            weighted_h = h * importance
+            
+            # Track statistics for monitoring
+            importance_entropy = -(importance * torch.log(importance + 1e-8)).sum()
+            importance_stats['entropy'].append(importance_entropy.item())
+            importance_stats['mean'].append(importance.mean().item())
+            importance_stats['std'].append(importance.std().item())
+            
+            # Process through expert
+            expert_input = torch.cat([weighted_h, code_emb], dim=-1)
+            output = expert(expert_input)
+            
+            # Place output in corresponding section (same as original)
+            # start_idx = i * (1024 // self.num_experts)
+            # end_idx = (i + 1) * (1024 // self.num_experts)
+            # weight = expert_weights[:, i].unsqueeze(1)
+            # full_output[:, start_idx:end_idx] = weight * output
+
+            # Fix: Dynamic soft partitioning
+            output_slices = torch.chunk(output, self.num_experts, dim=-1)  # [B,T,1024/num_experts]
+            expert_contribution = output_slices[i] * topk_weights[..., i].unsqueeze(-1)
+            full_output += expert_contribution
+
+        
+        # Load balancing loss (same as original)
+        expert_counts = expert_weights.sum(0)
+        expert_load = expert_counts / expert_counts.sum()
+        routing_loss = 0.5 * (expert_counts.std() + expert_load.entropy())
+        
+        # Add negative entropy regularization to encourage focused importance
+        avg_importance_entropy = sum(importance_stats['entropy']) / self.num_experts
+        aux_loss = routing_loss - self.importance_reg * avg_importance_entropy
+        
+        return full_output, aux_loss, importance_stats
+
 

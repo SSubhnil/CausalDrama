@@ -1,3 +1,4 @@
+from causal_model.core.networks import ImportanceWeightedMoE
 import numpy as np
 import torch
 import torch.nn as nn
@@ -76,16 +77,40 @@ class StateModulator(nn.Module):
 
 
 class MoETransitionHead(nn.Module):
-    def __init__(self, moe_net, hidden_state_dim, hidden_dim, code_dim, conf_dim, state_modulator, compute_inv_loss=False):
+    def __init__(self, moe_net, hidden_state_dim, hidden_dim, code_dim, conf_dim, state_modulator, compute_inv_loss=False,
+    use_importance_weighted_moe=True, importance_reg=0.01):
         super().__init__()
-        self.moe = moe_net
+
+        # Choose between SparseCodeookMoE or FeatureImportanceWeightedMoE
+        self.use_importance_weighted_moe = use_importance_weighted_moe
+
         self.hidden_state_dim = hidden_state_dim
         self.compute_inv_loss = compute_inv_loss
         # State modulator
-        self.state_modulator = StateModulator(hidden_state_dim, hidden_dim, code_dim, conf_dim)
+        self.state_modulator = state_modulator
+
+        if use_importance_weighted_moe:
+            # Create ImportanceWeightedMoE with parameters from original MOE
+            num_experts = moe_net.num_experts if hasattr(moe_net, 'num_experts') else len(moe_net.experts)
+            self.moe = ImportanceWeightedMoE(
+                num_experts=num_experts,
+                hidden_dim=hidden_dim,
+                code_dim=code_dim,
+                quantizer=moe_net,
+                top_k=moe_net.top_k if hasattr(moe_net, 'top_k') else 2,
+                importance_reg=importance_reg
+            )
+        else:
+            # Use the original MoE
+            self.moe = moe_net
+    
 
         # Confounding effect module
-        self.conf_mask = nn.Parameter(torch.zeros(hidden_dim))
+        # self.conf_mask = nn.Parameter(torch.zeros(hidden_dim))
+        self.conf_mask = nn.Sequential(
+                            nn.Linear(code_dim + conf_dim, hidden_dim),
+                            nn.Sigmoid()
+                        )
         self.f_conf = nn.Sequential(
             nn.Linear(conf_dim, hidden_dim),
             nn.ReLU(),
@@ -94,8 +119,10 @@ class MoETransitionHead(nn.Module):
 
         # Final Projection layer to Next-state logits
         # Output from SparseCodebookMoE is a 1024 projection, but not logits
-        self.final_proj = nn.Sequential(nn.Linear(1024, 1024),
-                                        nn.LogSoftmax(dim=-1) # For categorical latent
+        self.final_proj = nn.Sequential(nn.Linear(1024, 1024*2),
+                                        nn.Mish(),
+                                        nn.Linear(1024*2, 1024),
+                                        nn.Tanh()  # Maintains bounded outputs while allowing density learning
                                         )
 
 
@@ -114,10 +141,18 @@ class MoETransitionHead(nn.Module):
 
         # Next state prediction - process through MoE
         code_emb_stable = code_emb.detach() # Detach to avoid backward into quantizer
-        moe_out, aux_loss = self.moe(h_modulated, code_emb_stable)
+
+        if self.use_importance_weighted_moe:
+            moe_out, aux_loss, importance_stats = self.moe(h_modulated, code_emb_stable)
+            # For logging
+            self.importance_stats = importance_stats
+        else:
+            moe_out, aux_loss = self.moe(h_modulated, code_emb_stable)
+        
+        modulation_input = torch.cat([code_emb_stable, u], dim=-1)
 
         # Apply confounding effect
-        conf_effect = self.f_conf(u) * torch.sigmoid(self.conf_mask)
+        conf_effect = self.f_conf(u) * self.conf_mask(modulation_input)
         sparsity_loss = torch.mean(torch.abs(self.conf_mask))
 
         # Combine outputs
@@ -134,6 +169,15 @@ class MoETransitionHead(nn.Module):
             f"Prediction head output dim {next_state_logits.shape[-1] != 1024}"
 
         return next_state_logits, total_loss, aux_loss, sparsity_loss
+
+    def get_importance_weights(self):
+        """Return the current importance weights for analysis"""
+        if self.use_importance_weighted_moe:
+            temperature = torch.clamp(self.moe.importance_temperature, min=0.1, max=5.0)
+            weights = [F.softmax(self.moe.feature_importance[i] / temperature, dim=0).detach().cpu()
+            for i in range(self.moe.num_experts)]
+            return weights
+        return None
 
 
 class RewardHead(nn.Module):
