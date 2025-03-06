@@ -1,4 +1,4 @@
-from causal_model.core.networks import ImportanceWeightedMoE
+from causal_model.core.networks import ImportanceWeightedMoE, SparseCodebookMoE
 import numpy as np
 import torch
 import torch.nn as nn
@@ -77,7 +77,7 @@ class StateModulator(nn.Module):
 
 
 class MoETransitionHead(nn.Module):
-    def __init__(self, moe_net, hidden_state_dim, hidden_dim, code_dim, conf_dim, state_modulator, compute_inv_loss=False,
+    def __init__(self, hidden_state_dim, hidden_dim, code_dim, conf_dim, state_modulator, compute_inv_loss=False,
     use_importance_weighted_moe=True, importance_reg=0.01):
         super().__init__()
 
@@ -102,7 +102,12 @@ class MoETransitionHead(nn.Module):
             )
         else:
             # Use the original MoE
-            self.moe = moe_net
+            self.moe = SparseCodebookMoE(num_experts=self.predictor_params.Transition.NumOfExperts,
+                                         hidden_dim=self.predictor_params.Transition.HiddenDim,
+                                         code_dim=self.code_dim,
+                                         quantizer=self.quantizer,
+                                         top_k=self.predictor_params.Transition.TopK,
+                                         )
     
 
         # Confounding effect module

@@ -46,7 +46,7 @@ class ConfounderPosterior(nn.Module):
         - Affine transformations code specific \phi_c(u)
     """
 
-    def __init__(self, code_dim: int, conf_dim: int, num_codes: int, params,
+    def __init__(self, code_dim: int, conf_dim: int, num_codes: int,
                  embed_dim: int = None, hidden_dim: int = 256):
         super().__init__()
         self.hidden_dim = hidden_dim

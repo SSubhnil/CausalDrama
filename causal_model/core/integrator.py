@@ -109,18 +109,13 @@ class CausalModel(nn.Module):
         })
         self.state_modulator = StateModulator(self.hidden_state_dim, self.predictor_params.Transition.HiddenDim,
                                               self.code_dim, self.confounder_params.ConfDim)
-        self.moe_net = SparseCodebookMoE(num_experts=self.predictor_params.Transition.NumOfExperts,
-                                         hidden_dim=self.predictor_params.Transition.HiddenDim,
-                                         code_dim=self.code_dim,
-                                         quantizer=self.quantizer,
-                                         top_k=self.predictor_params.Transition.TopK,
-                                         )
-        self.tr_head = MoETransitionHead(moe_net=self.moe_net,
-                                         hidden_state_dim=self.hidden_state_dim,
+
+        self.tr_head = MoETransitionHead(hidden_state_dim=self.hidden_state_dim,
                                          hidden_dim=self.predictor_params.Transition.HiddenDim,
                                          code_dim=self.code_dim,
                                          conf_dim=self.confounder_params.ConfDim,
-                                         state_modulator=self.state_modulator
+                                         state_modulator=self.state_modulator,
+                                         use_importance_weighted_moe=self.predictor_params.Transition.UseImportanceWeightedMoE
                                          )
 
         self.re_head = ImprovedRewardHead(num_codes=self.num_codes_re,

@@ -156,6 +156,7 @@ Models:
       RewardWeight: 1.0         # Main objective - reward prediction
       TerminationWeight: 0.5    # Secondary Objective - episode termination
       Transition:
+        UseImportanceWeightedMoE: True
         NumOfExperts: 8
         TopK: 3
         HiddenDim: 512
