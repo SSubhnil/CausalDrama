@@ -3,7 +3,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from networks import MLP
+from .networks import MLP
 
 class CausalEncoder(nn.Module):
     def __init__(self, hidden_state_dim: int, tr_proj_dim: int, re_proj_dim: int, hidden_dim: int):

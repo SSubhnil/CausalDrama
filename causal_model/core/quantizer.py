@@ -17,7 +17,7 @@ class VQQuantizer(nn.Module):
     - A quantization loss to update the codebook
     """
     def __init__(self, num_codes: int, code_dim: int, beta: float = 0.25,
-                 initial_temp: float = 1.0, use_cdist: bool = False, normalize: bool = True):
+                 initial_temp: float = 1.0, use_cdist: bool = True, normalize: bool = True):
         super().__init__()
         self.initial_temp = initial_temp # Track base temperature
         self.temperature = initial_temp # Active temperature
@@ -44,6 +44,10 @@ class VQQuantizer(nn.Module):
         Args:
             h (Tensor): Input latent embeddings of shape [B, D]
         """
+        original_shape = h.shape
+        if h.dim == 3:
+            h = h.view(-1, h.shape[-1])  # Flatten to [B*T, D]
+
         # Unit sphere normalization with numerical stability
         if self.normalize:
             h = F.normalize(h, p=2, dim=1, eps=1e-6)
@@ -62,9 +66,18 @@ class VQQuantizer(nn.Module):
         # Compute Gumbel-soft assignments with temperature scaling
         q = F.gumbel_softmax(-distances, tau=self.temperature,hard=False, dim=1) # [B, num_codes]
 
-        # Gumbel Soft quantized code as a weighted sum
-        c_tilde = torch.bmm(q.unsqueeze(1), codebook.expand(q.size(0), -1, -1)).squeeze(1) # more efficient
-        # c_tilde = torch.matmul(q, codebook) # [B, D]
+        # Fix einsum dimension mismatch
+        if q.dim() == 3:  # [B, T, K]
+            q_flat = q.view(-1, q.size(-1))  # [B*T, K]
+            c_tilde = torch.einsum('bk,kd->bd', q_flat, codebook)  # [B*T, D]
+            c_tilde = c_tilde.view(*q.shape[:-1], -1)  # [B, T, D]
+        else:  # Handle 2D case [B, K]
+            c_tilde = torch.einsum('bk,kd->bd', q, codebook)
+
+        # Reshape back for sequence processing
+        if len(original_shape) == 3:
+            q = q.reshape(original_shape[0], original_shape[1], -1)
+            c_tilde = c_tilde.reshape(original_shape[0], original_shape[1], -1)
 
         # Hard assignments via argmax
         indices = torch.argmax(q, dim=1)  # [B]  Non-differentiable
@@ -99,7 +112,8 @@ class DualVQQuantizer(nn.Module):
         - One for reward branch
         - (Optional) Coupling loss between two branches
     """
-    def __init__(self, code_dim: int,
+    def __init__(self, code_dim_tr: int,
+                 code_dim_re: int,
                  num_codes_tr: int,
                  num_codes_re: int,
                  beta_tr: float = 0.25,
@@ -118,9 +132,9 @@ class DualVQQuantizer(nn.Module):
         self.tr_factor = tr_anneal_factor
         self.re_factor = re_anneal_factor
 
-        self.tr_quantizer = VQQuantizer(num_codes=num_codes_tr, code_dim=code_dim, beta=beta_tr,
+        self.tr_quantizer = VQQuantizer(num_codes=num_codes_tr, code_dim=code_dim_tr, beta=beta_tr,
                                         initial_temp=self.tr_temperature, use_cdist=use_cdist, normalize=normalize)
-        self.re_quantizer = VQQuantizer(num_codes=num_codes_re, code_dim=code_dim, beta=beta_re,
+        self.re_quantizer = VQQuantizer(num_codes=num_codes_re, code_dim=code_dim_re, beta=beta_re,
                                         initial_temp=self.re_temperature, use_cdist=use_cdist, normalize=normalize)
 
         self.coupling = coupling

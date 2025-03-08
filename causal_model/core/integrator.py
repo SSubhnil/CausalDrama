@@ -1,22 +1,17 @@
-import numpy as np
-import torch
 import torch.nn as nn
-import torch.nn.init as init
-import torch.functional as F
 
-from causal_model.core.networks import SparseCodebookMoE
-from encoder import CausalEncoder, CausalEncoder
-from quantizer import DualVQQuantizer
-from confounder_approx import ConfounderPosterior, ConfounderPrior
-from predictors import MoETransitionHead, ImprovedRewardHead, TerminationPredictor, StateModulator
-from networks import SparseCodebookMoE
+from .encoder import CausalEncoder
+from .quantizer import DualVQQuantizer
+from .confounder_approx import ConfounderPosterior, ConfounderPrior
+from .predictors import MoETransitionHead, ImprovedRewardHead, TerminationPredictor, StateModulator
 
 
 class CausalModel(nn.Module):
     def __init__(self, params, device):
         super().__init__()
         self.hidden_state_dim = params.Models.WorldModel.HiddenStateDim
-        self.code_dim = params.Models.CausalModel.CodeDim
+        self.code_dim_tr = params.Models.CausalModel.TrCodeDim
+        self.code_dim_re = params.Models.CausalModel.ReCodeDim
         self.num_codes_tr = params.Models.CausalModel.NumCodesTr
         self.num_codes_re = params.Models.CausalModel.NumCodesRe
         self.hidden_dim = params.Models.CausalModel.HiddenDim
@@ -47,7 +42,8 @@ class CausalModel(nn.Module):
                 beta_tr, beta_re
         """
         self.quantizer_params = params.Models.CausalModel.Quantizer
-        self.quantizer = DualVQQuantizer(code_dim=self.code_dim,
+        self.quantizer = DualVQQuantizer(code_dim_tr=self.code_dim_tr,
+                                         code_dim_re=self.code_dim_re,
                                          num_codes_tr=self.num_codes_tr,
                                          num_codes_re=self.num_codes_re,
                                          beta_tr=self.quantizer_params.BetaTransition,
@@ -63,6 +59,7 @@ class CausalModel(nn.Module):
                                          sparsity_weight=self.quantizer_params.SparsityWeight, # Coupling sparsity
                                          lambda_couple=self.quantizer_params.LambdaCouple,
                                          hidden_dim=self.hidden_dim,
+                                         use_cdist=self.quantizer_params.UseCDist
                                          )
 
         """
@@ -88,11 +85,11 @@ class CausalModel(nn.Module):
             'kl_loss_weight': self.confounder_params.PostKLWeight
         })
         self.confounder_prior_net = ConfounderPrior(num_codes=self.num_codes_tr,
-                                                    code_dim=self.code_dim,
+                                                    code_dim=self.code_dim_tr,
                                                     conf_dim=self.confounder_params.ConfDim,
                                                     hidden_state_proj_dim=self.encoder_params.TransProjDim,
                                                     momentum=self.confounder_params.PriorMomentum)
-        self.confounder_post_net = ConfounderPosterior(code_dim=self.code_dim,
+        self.confounder_post_net = ConfounderPosterior(code_dim=self.code_dim_tr,
                                                        conf_dim=self.confounder_params.ConfDim,
                                                        num_codes=self.num_codes_tr,
                                                        hidden_dim=self.confounder_params.HiddenDim)
@@ -102,24 +99,28 @@ class CausalModel(nn.Module):
             Transition Head: aux_loss (SparseCodebookMoE), Sparsity Loss
             Loss weights: aux_loss, Sparsity_loss
         """
-        self.predictor_params = self.params.Models.CausalModel.Predictors
+        self.predictor_params = params.Models.CausalModel.Predictors
         self.loss_weights.update({
             'tr_aux_loss': self.predictor_params.Transition.AuxiliaryWeight,
             'tr_sparsity_weight': self.predictor_params.Transition.MaskSparsityWeight
         })
         self.state_modulator = StateModulator(self.hidden_state_dim, self.predictor_params.Transition.HiddenDim,
-                                              self.code_dim, self.confounder_params.ConfDim)
+                                              self.code_dim_tr, self.confounder_params.ConfDim)
+
 
         self.tr_head = MoETransitionHead(hidden_state_dim=self.hidden_state_dim,
                                          hidden_dim=self.predictor_params.Transition.HiddenDim,
-                                         code_dim=self.code_dim,
+                                         code_dim=self.code_dim_tr,
                                          conf_dim=self.confounder_params.ConfDim,
+                                         num_experts=self.predictor_params.Transition.NumOfExperts,
+                                         top_k=self.predictor_params.Transition.TopK,
                                          state_modulator=self.state_modulator,
+                                         quantizer=self.quantizer,
                                          use_importance_weighted_moe=self.predictor_params.Transition.UseImportanceWeightedMoE
                                          )
 
         self.re_head = ImprovedRewardHead(num_codes=self.num_codes_re,
-                                          code_dim=self.code_dim,
+                                          code_dim=self.code_dim_re,
                                           hidden_dim=self.predictor_params.Reward.HiddenDim,
                                           hidden_state_dim=self.hidden_state_dim,
                                           num_heads=self.predictor_params.Reward.NumHeads)
@@ -145,7 +146,7 @@ class CausalModel(nn.Module):
         quant_output_dict = self.quantizer(h_proj_tr, h_proj_re)
         code_emb_tr = quant_output_dict['quantized_tr']
         # Quantization Loss Total - loss weights in-code
-        quant_loss = quant_output_dict['total_loss']
+        quant_loss = quant_output_dict['loss']
 
         # Confounder approximation with transition codebook
         # Prior uses EMA codebook entries ('code_emb_momentum') that require discrete indices for lookup.

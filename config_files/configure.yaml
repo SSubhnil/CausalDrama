@@ -102,10 +102,11 @@ Models:
 
   CausalModel:
     dtype: float32
-    CodeDim: 32               # [16, 24, 32, 64] Dimension of codebook entries
+    TrCodeDim: 256               # [16, 24, 32, 64] Dimension of codebook entries
+    ReCodeDim: 128
     NumCodesTr: 128           # Transition codebook size
     NumCodesRe: 64            # Reward codebook size
-    HiddenDim: 256            # Hidden dimension for MLPs
+    HiddenDim: 512           # Hidden dimension for MLPs
     UseConfounder: False      # Flag to use confounder encoder and approximator
 
     Encoder:                  # Avoid bottlenecking -> hidden_dim == hidden_state_dim
@@ -127,7 +128,7 @@ Models:
       Coupling: True          # Enable codebook coupling
       SparsityWeight: 0.1     # Sparsity Loss for coupling
       LambdaCouple: 0.1       # Coupling loss weight
-      UseCDist: False
+      UseCDist: True
 
     Confounder:
       ConfDim: 128            # Confounder Dimensions
@@ -226,6 +227,6 @@ Models:
         HiddenUnits: 512 # Andrychowicz2020 wider critic network seems better  
 Wandb:
   Init:
-    Mode: online
-    Project: Mamba_dreamer
+    Mode: disabled
+    Project: Causal_Mamba
 n: standard

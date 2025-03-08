@@ -400,8 +400,16 @@ class WorldModel(nn.Module):
                 dist_feat = self.sequence_model(latent, action, temporal_mask)
             else:
                 dist_feat = self.sequence_model(latent, action, inference_params)
+
+
             last_dist_feat = dist_feat[:, -1:]
-            prior_logits = self.dist_head.forward_prior(last_dist_feat)
+            # Add causal model processing
+            quant_output_dict, u_post, _ = self.causal_model(last_dist_feat)
+            modulated_feat, _ = self.causal_model.state_modulator(last_dist_feat, quant_output_dict['quantized_tr'],
+                                                                  u_post)
+            code_emb_tr = quant_output_dict['quantized_tr'][:, -1:]  # Get transition codes
+
+            prior_logits, _, _, _ = self.dist_head.forward_prior(modulated_feat, code_emb_tr, u_post)
             prior_sample = self.stright_throught_gradient(prior_logits, sample_mode="random_sample")
             prior_flattened_sample = self.flatten_sample(prior_sample)
         return prior_flattened_sample, last_dist_feat

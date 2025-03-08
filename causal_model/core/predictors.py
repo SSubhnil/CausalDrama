@@ -1,4 +1,4 @@
-from causal_model.core.networks import ImportanceWeightedMoE, SparseCodebookMoE
+from .networks import ImportanceWeightedMoE, SparseCodebookMoE
 import numpy as np
 import torch
 import torch.nn as nn
@@ -77,7 +77,7 @@ class StateModulator(nn.Module):
 
 
 class MoETransitionHead(nn.Module):
-    def __init__(self, hidden_state_dim, hidden_dim, code_dim, conf_dim, state_modulator, compute_inv_loss=False,
+    def __init__(self, hidden_state_dim, hidden_dim, code_dim, conf_dim, num_experts, top_k, state_modulator, quantizer, compute_inv_loss=False,
     use_importance_weighted_moe=True, importance_reg=0.01):
         super().__init__()
 
@@ -91,13 +91,12 @@ class MoETransitionHead(nn.Module):
 
         if use_importance_weighted_moe:
             # Create ImportanceWeightedMoE with parameters from original MOE
-            num_experts = moe_net.num_experts if hasattr(moe_net, 'num_experts') else len(moe_net.experts)
             self.moe = ImportanceWeightedMoE(
                 num_experts=num_experts,
                 hidden_dim=hidden_dim,
                 code_dim=code_dim,
-                quantizer=moe_net,
-                top_k=moe_net.top_k if hasattr(moe_net, 'top_k') else 2,
+                quantizer=quantizer,
+                top_k=top_k,
                 importance_reg=importance_reg
             )
         else:
@@ -134,8 +133,11 @@ class MoETransitionHead(nn.Module):
 
         """Replace with learnable sparsity mask"""
         # Initialize sparse mask - may not be as flexible as a fully learable mask
-        nn.init.normal_(self.conf_mask, std=0.01)
-        self.conf_mask.register_hook(lambda grad: grad * (torch.abs(grad) > 0.1).float())
+        # Initialize only the Linear layer's weights
+        nn.init.normal_(self.conf_mask[0].weight, std=0.01)
+        nn.init.zeros_(self.conf_mask[0].bias)  # Also initialize bias if needed
+        # Register hook on the Linear layer's weight parameter specifically
+        self.conf_mask[0].weight.register_hook(lambda grad: grad * (torch.abs(grad) > 0.1).float())
 
     def forward(self, h_modulated, code_emb, u):
         """

@@ -8,31 +8,45 @@ class MLP(nn.Module):
     def __init__(self, input_dim, output_dim, hidden_dims, activation=nn.ReLU, init_type='kaiming'):
         super().__init__()
         layers = []
-        dims = [input_dim] + hidden_dims + [output_dim]
+        
+        # Ensure hidden_dims is a list
+        if isinstance(hidden_dims, int):
+            hidden_dims = [hidden_dims]
+            
+        # Create a list of dimensions for all layers
+        dims = [input_dim] + list(hidden_dims) + [output_dim]
 
-        for i, (input_dim, output_dim) in enumerate(zip(dims[:-1], dims[1:])):
-            layers.append(nn.Linear(input_dim, output_dim))
+        for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:])):
+            layers.append(nn.Linear(in_dim, out_dim))
 
             if i < len(dims)-2: # NO activation after final layer
                 layers.append(activation())
 
         self.net = nn.Sequential(*layers)
-        layers.apply(self._init_weights)
+        self.init_type = init_type  # Store init_type as an instance variable
+        self._init_weights(self.net)  # Apply weights initialization to the network
         self.norms = nn.ModuleList([nn.LayerNorm(dim) for dim in hidden_dims])
 
     def forward(self, x):
-        for i, layer in enumerate(self.net):
-            x = layer(x)
-            if i % 2 == 0 and i//2 < len(self.norms): # Apply norm after linear layer
-                x = self.norms[i//2](x)
+        layer_idx = 0
+        norm_idx = 0
+        
+        for module in self.net:
+            x = module(x)
+            
+            # Apply layer normalization after linear layers (but before activation)
+            if isinstance(module, nn.Linear) and norm_idx < len(self.norms):
+                x = self.norms[norm_idx](x)
+                norm_idx += 1
+                
         return x
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             nn.init.orthogonal_(module.weight)
             nn.init.normal_(module.bias, std=1e-6)
-        if self.ini_type == 'kaiming':
-            kaiming_normal_(module.weight)
+            if self.init_type == 'kaiming':
+                kaiming_normal_(module.weight)
 
 # Switch transformers [Fedus et al. 2021] logic
 class SparseCodebookMoE(nn.Module):
@@ -43,7 +57,7 @@ class SparseCodebookMoE(nn.Module):
         # Codebook aligned initialization
         """Handle quantized_Tr in integrator.py"""
         self.register_buffer('code_anchor',
-                             quantizer.tr_quantizer.weight.data[:num_experts].clone())
+                             quantizer.tr_quantizer.codebook.data[:num_experts].clone())
         self.experts = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(hidden_dim + code_dim, 4*hidden_dim),
@@ -116,7 +130,7 @@ class ImportanceWeightedMoE(nn.Module):
         super().__init__()
         # Initialize with your existing code anchors
         self.register_buffer('code_anchor',
-                            quantizer.tr_quantizer.weight.data[:num_experts].clone())
+                            quantizer.tr_quantizer.codebook.data[:num_experts].clone())
         
         # Feature importance weights for each expert
         self.feature_importance = nn.Parameter(torch.zeros(num_experts, hidden_dim))
@@ -209,5 +223,3 @@ class ImportanceWeightedMoE(nn.Module):
         aux_loss = routing_loss - self.importance_reg * avg_importance_entropy
         
         return full_output, aux_loss, importance_stats
-
-

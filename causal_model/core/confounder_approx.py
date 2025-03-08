@@ -54,6 +54,10 @@ class ConfounderPosterior(nn.Module):
         self.conf_dim = conf_dim
         self.num_codes = num_codes
 
+        self.embed_dim = code_dim  # Should match code embedding dimension
+        if embed_dim is not None:
+            self.embed_dim = embed_dim
+
         # Code embedding layer
         self.h_proj = nn.Linear(self.code_dim, self.hidden_dim)
         self.code_proj = nn.Linear(self.embed_dim, self.hidden_dim)
@@ -137,7 +141,7 @@ class ConfounderPrior(nn.Module):
         super().__init__()
 
         self.code_embed = nn.Embedding(num_codes, code_dim) # Shared embeddings
-        self.register_buffer('code_emb_momentum', torch.empty_like(self.code_emb.weight))
+        self.register_buffer('code_emb_momentum', torch.empty_like(self.code_embed.weight))
         nn.init.orthogonal_(self.code_emb_momentum)  # Independent initialization
         self.momentum = momentum
         self.h_proj_dim = hidden_state_proj_dim
@@ -145,13 +149,14 @@ class ConfounderPrior(nn.Module):
         # Physics-inspired parameter bounds
         self.mu_net = nn.Sequential(nn.Linear(self.h_proj_dim + code_dim, conf_dim),
                                     nn.LayerNorm(conf_dim),
+                                    nn.Linear(conf_dim, conf_dim),
                                     nn.Tanh() # Constrained output
                                     )
         nn.init.kaiming_normal_(self.mu_net[0].weight, nonlinearity='linear')  # First linear layer
         # Initialize final layer for natural parameter bounds
         with torch.no_grad():
-            self.mu_net[-1].weight.data.uniform_(-0.01, 0.01)  # Small magnitude
-            self.mu_net[-1].bias.data.zero_()  # Center outputs
+            self.mu_net[2].weight.data.uniform_(-0.01, 0.01)  # Small magnitude
+            self.mu_net[2].bias.data.zero_()  # Center outputs
         self.register_buffer('mu_bounds', torch.tensor([-3.0, 3.0]))
 
         self.logvar_net = nn.Sequential(
@@ -164,13 +169,29 @@ class ConfounderPrior(nn.Module):
         # Update momentum codebook
         with torch.no_grad():
             self.code_emb_momentum = (self.momentum * self.code_emb_momentum +
-                                      (1 - self.momentum) * self.code_emb.weight.detach())
+                                      (1 - self.momentum) * self.code_embed.weight.detach())
 
+        # Handle 3D input (batch, sequence, features)
+        if h.dim() == 3 and code_ids is not None:
+            batch_size, seq_len = h.shape[0], h.shape[1]
+
+            # Reshape code_ids to match sequence length
+            if code_ids.dim() == 2 and code_ids.shape[1] != seq_len:
+                # Take only the first seq_len indices
+                code_ids = code_ids[:, :seq_len]
+
+        # Ensure indices are in bounds
+        max_idx = self.code_emb_momentum.size(0) - 1
+        code_ids = torch.clamp(code_ids, 0, max_idx)
+
+        # Lookup embeddings
         code_feat = self.code_emb_momentum[code_ids]
 
-        combined = torch.cat([h, code_feat], -1)
+        # Concatenate along feature dimension
+        combined = torch.cat([h, code_feat], dim=-1)
 
-        mu = self.mu_net(combined).clamp(*self.mu_bounds) # [-3, 3] physical constraint
+        # Generate outputs
+        mu = self.mu_net(combined).clamp(*self.mu_bounds)
         logvar = self.logvar_net(combined)
 
         return mu, logvar
@@ -200,7 +221,7 @@ class ConfounderPrior(nn.Module):
 
     def code_alignment_loss(self):
         """Tries to match momentum vs actual embeddings"""
-        return F.mse_loss(self.code_emb_momentum, self.code_emb.weight.detach())
+        return F.mse_loss(self.code_emb_momentum, self.code_embed.weight.detach())
 
 """
 Few-shot phase: detecting new confounder
