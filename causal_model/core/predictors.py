@@ -112,13 +112,15 @@ class MoETransitionHead(nn.Module):
         # Confounding effect module
         # self.conf_mask = nn.Parameter(torch.zeros(hidden_dim))
         self.conf_mask = nn.Sequential(
-                            nn.Linear(code_dim + conf_dim, hidden_dim),
-                            nn.Sigmoid()
-                        )
+            nn.Linear(code_dim + conf_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1024),  # Changed from hidden_dim to 1024
+            nn.Sigmoid()
+        )
         self.f_conf = nn.Sequential(
             nn.Linear(conf_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim)
+            nn.Linear(hidden_dim, 1024)  # Changed from hidden_dim to 1024
         )
 
         # Final Projection layer to Next-state logits
@@ -140,40 +142,41 @@ class MoETransitionHead(nn.Module):
         self.conf_mask[0].weight.register_hook(lambda grad: grad * (torch.abs(grad) > 0.1).float())
 
     def forward(self, h_modulated, code_emb, u):
-        """
-        total_loss = pred_loss + 0.01*aux_loss + 0.1*conf_sparsity
-        """
-        # Modulate the hidden state
-        # h_modulated, inv_loss = self.state_modulator(h, code_emb, u, self.compute_inv_loss)
+        # Get stable code embeddings
+        code_emb_stable = code_emb.detach()
 
-        # Next state prediction - process through MoE
-        code_emb_stable = code_emb.detach() # Detach to avoid backward into quantizer
+        # Ensure compatible dimensions
+        if code_emb_stable.shape[1] != u.shape[1]:
+            if code_emb_stable.shape[1] == 1:
+                code_emb_stable = code_emb_stable.expand(-1, u.shape[1], -1)
+            elif u.shape[1] == 1:
+                u = u.expand(-1, code_emb_stable.shape[1], -1)
 
-        if self.use_importance_weighted_moe:
-            moe_out, aux_loss, importance_stats = self.moe(h_modulated, code_emb_stable)
-            # For logging
-            self.importance_stats = importance_stats
-        else:
-            moe_out, aux_loss = self.moe(h_modulated, code_emb_stable)
-        
+        # Process through MoE
+        moe_out, aux_loss, importance_stats = self.moe(h_modulated, code_emb_stable)
+
+        # Create modulation input
         modulation_input = torch.cat([code_emb_stable, u], dim=-1)
 
-        # Apply confounding effect
-        conf_effect = self.f_conf(u) * self.conf_mask(modulation_input)
-        sparsity_loss = torch.mean(torch.abs(self.conf_mask))
+        # Calculate confounding effect
+        f_conf_out = self.f_conf(u)  # [10, 128, 512]
+        mask_output = self.conf_mask(modulation_input)  # [10, 128, 512]
+        conf_effect = f_conf_out * mask_output  # Element-wise multiplication
+
+        # Compute sparsity loss
+        sparsity_loss = torch.mean(torch.abs(mask_output))
 
         # Combine outputs
-        output = moe_out * (1 - self.conf_mask.sigmoid()) + conf_effect
+        output = moe_out * (1 - mask_output) + conf_effect
 
         # Final projection to next state logits
         next_state_logits = self.final_proj(output)
 
         # Compute total loss
         total_loss = aux_loss + sparsity_loss
-        # total_loss = 0.01 * aux_loss + 0.1 * inv_loss + 0.05 * conf_sparsity
 
         assert next_state_logits.shape[-1] == 1024, \
-            f"Prediction head output dim {next_state_logits.shape[-1] != 1024}"
+            f"Prediction head output dim {next_state_logits.shape[-1]} != 1024"
 
         return next_state_logits, total_loss, aux_loss, sparsity_loss
 

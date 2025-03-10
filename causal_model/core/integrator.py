@@ -133,18 +133,20 @@ class CausalModel(nn.Module):
                                                dtype=params.Models.WorldModel.dtype,
                                                device=self.device)
 
-
     def forward(self, h, detach_encoder=True):
-        if detach_encoder: # Blocks gradient flow from the causal model to world model.
+        if detach_encoder:
             h_stable = h.detach()
         else:
             h_stable = h
+
         # Projection of raw hidden state into h_tr and h_re
         h_proj_tr, h_proj_re = self.causal_encoder(h_stable)
 
         # Projections go into Dual Codebook Quantizer
         quant_output_dict = self.quantizer(h_proj_tr, h_proj_re)
+
         code_emb_tr = quant_output_dict['quantized_tr']
+
         # Quantization Loss Total - loss weights in-code
         quant_loss = quant_output_dict['loss']
 
@@ -159,11 +161,16 @@ class CausalModel(nn.Module):
         # Confounder posterior
         u_post, kl_loss = self.confounder_post_net(h_proj_tr, code_emb_tr,
                                                    mu_prior, logvar_prior)
-        post_l2_reg, post_sparsity = self.confounder_post_net.regularization_loss() * self.loss_weights['post_reg']
-        confounder_loss = prior_code_alignment_loss + prior_reg_loss + \
-                           (post_l2_reg * self.loss_weights['post_reg']) + \
-                           (post_sparsity * self.loss_weights['post_sparsity']) + \
-                           (kl_loss * self.loss_weights['kl_loss_weight'])
+        post_l2_reg, post_sparsity = self.confounder_post_net.regularization_loss()
+
+        # Apply the weight to each component individually
+        post_l2_reg = post_l2_reg * self.loss_weights['post_reg']
+        post_sparsity = post_sparsity * self.loss_weights['post_sparsity']
+        kl_loss = kl_loss * self.loss_weights['kl_loss_weight']
+
+        confounder_loss = prior_code_alignment_loss + prior_reg_loss + post_l2_reg +\
+            post_sparsity + kl_loss
+
         causal_loss = quant_loss + confounder_loss
 
         return quant_output_dict, u_post, causal_loss

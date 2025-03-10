@@ -16,26 +16,66 @@ Unfreeze prior every 3 steps
     # code_loss.backward()
 """
 
+
 class PosteriorHypernet(nn.Module):
     """Generates posterior network weights conditioned on the code IDs"""
+
     def __init__(self, code_dim, hidden_dim, out_dim):
         super().__init__()
-        # Factorized weight generation
-        self.w1_proj = nn.Linear(code_dim, 2*hidden_dim)
-        self.w2_proj = nn.Linear(code_dim, 2*out_dim)
+        self.hidden_dim = hidden_dim
+        self.code_dim = code_dim
+        self.out_dim = out_dim
 
-        # Kaiming initialization optimized for SiLU
-        nn.init.kaiming_normal_(self.w1_proj.weight, nonlinearity='linear')
-        nn.init.kaiming_normal_(self.w2_proj.weight, nonlinearity='linear')
+        # Factorized weight generation
+        self.w1_proj = nn.Linear(code_dim, 2 * hidden_dim)
+        self.w2_proj = nn.Linear(code_dim, 2 * out_dim)
+
+        self.seq_proj = nn.Linear(code_dim, hidden_dim)  # For sequence dimension processing
+
+        # Initialization (using smaller values for stability)
+        nn.init.normal_(self.w1_proj.weight, std=0.01)
+        nn.init.normal_(self.w2_proj.weight, std=0.01)
+        nn.init.zeros_(self.w1_proj.bias)
+        nn.init.zeros_(self.w2_proj.bias)
 
     def forward(self, x, code_emb):
-        # Split weights for parallel computation
-        w1 = self.w1_proj(code_emb).unflatten(-1, (2, self.hidden_dim))
-        w2 = self.w2_proj(code_emb).unflatten(-1, (2, self.out_dim))
+        # Handle 4D inputs from world model [B, C, H, W]
+        orig_x_shape = x.shape
+        x = x.reshape(orig_x_shape[0], -1)  # Flatten to [B, D]
 
-        # Fused operations
-        x = F.silu(F.linear(x, w1[0], None) + w1[1])
-        return F.linear(x, w2[0], None) + w2[1]
+        # Check dimensions
+        if x.shape[-1] != self.code_dim:
+            print(f"WARNING: Input dimension {x.shape[-1]} doesn't match expected code_dim {self.code_dim}")
+
+        # Original sequence handling with 4D-aware reshaping
+        if code_emb.dim() == 3 and x.dim() == 2:  # code_emb: [B,T,D], x: [B,D]
+            B, T, D = code_emb.shape
+            # Process code embeddings
+            code_emb_flat = code_emb.reshape(B * T, D)
+            w1 = self.w1_proj(code_emb_flat).unflatten(-1, (2, self.hidden_dim))
+            w2 = self.w2_proj(code_emb_flat).unflatten(-1, (2, self.out_dim))
+
+            # Expand x with proper 4D->3D->2D reshaping
+            x_expanded = x.unsqueeze(1)  # [B,1,D]
+            x_expanded = x_expanded.expand(-1, T, -1)  # [B,T,D]
+            x_expanded = x_expanded.reshape(B * T, -1)  # [B*T,D]
+
+
+
+            # Fix: Transpose each individual weight matrix correctly
+            # This makes the weight matrix compatible with x_expanded for multiplication
+            h = F.silu(F.linear(x_expanded, w1[:, 0].view(B * T, -1).transpose(0, 1)[:, :D]) + w1[:, 1])
+            output = F.linear(h, w2[:, 0].view(B * T, -1).transpose(0, 1)[:, :self.hidden_dim]) + w2[:, 1]
+
+            return output.reshape(B, T, -1)
+        else:
+            # Existing 2D/3D handling (also fixing the typo in original code)
+            w1 = self.w1_proj(code_emb).unflatten(-1, (2, self.hidden_dim))
+            w2 = self.w2_proj(code_emb).unflatten(-1, (2, self.out_dim))
+
+            # Fix: Apply proper matrix multiplication
+            h = F.silu(F.linear(x, w1[:, 0].view(code_emb.size(0), -1).transpose(0, 1)[:, :x.size(1)]) + w1[:, 1])
+            return F.linear(h, w2[:, 0].view(code_emb.size(0), -1).transpose(0, 1)[:, :self.hidden_dim]) + w2[:, 1]
 
 class ConfounderPosterior(nn.Module):
     """
@@ -53,10 +93,19 @@ class ConfounderPosterior(nn.Module):
         self.code_dim = code_dim
         self.conf_dim = conf_dim
         self.num_codes = num_codes
+        self.embed_dim = code_dim
 
-        self.embed_dim = code_dim  # Should match code embedding dimension
         if embed_dim is not None:
             self.embed_dim = embed_dim
+
+        # Check dimensions match config
+        config_hidden_dim = 512
+        config_conf_dim = 128
+        config_code_dim = 256
+
+        if hidden_dim != config_hidden_dim or conf_dim != config_conf_dim or code_dim != config_code_dim:
+            print(f"WARNING: Dimensions may not match config.yaml values. "
+                  f"Expected: hidden_dim={config_hidden_dim}, conf_dim={config_conf_dim}, code_dim={config_code_dim}")
 
         # Code embedding layer
         self.h_proj = nn.Linear(self.code_dim, self.hidden_dim)
@@ -73,35 +122,55 @@ class ConfounderPosterior(nn.Module):
         self._sqrt_2pi = torch.sqrt(torch.tensor(2 * torch.pi))
         self._eps = torch.finfo(torch.float32).eps
 
-
-    def forward(self, h: torch.Tensor, quantized_tr, mu_prior, logvar_prior):
+    def check_dimensions(self, tensor, expected_shape, name="tensor", tolerance=0):
         """
+        Verify tensor dimensions match expected shape.
+
         Args:
-            h: Hidden state from world model [B, D]
-            code_ids: Discrete code indices [B]
+            tensor: The tensor to check
+            expected_shape: Tuple of expected dimensions
+            name: Name of tensor for error message
+            tolerance: Number of dimensions that can differ
 
         Returns:
-            u_transformer: Confounder after code-specific affine [B, conf_dim]
-            kl_loss: D_KL(Q(u|h,c) || P(u|h)) + regularization
+            bool: Whether dimensions are valid
         """
-        with torch.autocast(device_type='cuda', dtype=torch.float16):
-            # Call confounder prior network
+        if len(tensor.shape) != len(expected_shape):
+            print(f"WARNING: {name} has {len(tensor.shape)} dimensions, expected {len(expected_shape)}")
+            return False
 
-            # Hypernetwork based posterior
-            #code_emb = self.code_embed(code_ids)  # [B, embed_dim]
-            # Maintains end-to-end gradient flow from posterior -> codebook (with actual code vectors)
-            code_emb = quantized_tr # [B, T, D] from quantizer
+        mismatches = sum(1 for a, b in zip(tensor.shape, expected_shape) if a != b)
+        if mismatches > tolerance:
+            print(f"WARNING: {name} shape {tensor.shape} doesn't match expected {expected_shape}")
+            return False
+
+        return True
+
+    def forward(self, h: torch.Tensor, code_emb, mu_prior, logvar_prior):
+        """
+        Args:
+            h: Hidden state projection from encoder
+            code_emb: Code embeddings from quantizer
+            mu_prior: Prior mean
+            logvar_prior: Prior log variance
+        """
+        # Check dimensions
+        self.check_dimensions(h, (h.size(0), h.size(1), self.code_dim), "h input")
+        self.check_dimensions(code_emb, (code_emb.size(0), code_emb.size(1), self.code_dim), "code_emb")
+
+        with torch.autocast(device_type='cuda', dtype=torch.float16):
+            # Generate posterior parameters
             mu_post = self.confounder_post_mu_net(h, code_emb)
+            self.check_dimensions(mu_post, (mu_post.size(0), mu_post.size(1), self.conf_dim), "mu_post")
+
             logvar_post = self.confounder_post_logvar_net(h, code_emb)
+            self.check_dimensions(logvar_post, (logvar_post.size(0), logvar_post.size(1), self.conf_dim), "logvar_post")
 
             # Reparameterization trick
-            u_post = self.reparameterize(mu_post, logvar_post)  # ~15% faster on CUDA
-
+            u_post = self.reparameterize(mu_post, logvar_post)
             kl_loss = self.gaussian_KL(mu_post, logvar_post, mu_prior, logvar_prior)
 
-        # Preserve precision for embeddings
-        self.code_embed = self.code_embed.to(torch.float32)
-        return u_post, kl_loss
+            return u_post, kl_loss
 
     # REDUNDANT due to non-use of scale and shift
     def regularization_loss_2(self, lamdba_weight=0.01):
