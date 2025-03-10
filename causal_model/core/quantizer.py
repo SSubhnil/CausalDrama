@@ -40,59 +40,59 @@ class VQQuantizer(nn.Module):
             kaiming_uniform_(self.codebook, a=math.sqrt(5))
 
     def forward(self, h: torch.Tensor):
-        """
-        Args:
-            h (Tensor): Input latent embeddings of shape [B, D]
-        """
+        # Store original shape for reshaping later
         original_shape = h.shape
-        if h.dim == 3:
-            h = h.view(-1, h.shape[-1])  # Flatten to [B*T, D]
+        is_3d = len(original_shape) == 3
 
-        # Unit sphere normalization with numerical stability
+        # Flatten 3D input to 2D for processing
+        if is_3d:
+            h_flat = h.reshape(-1, h.shape[-1])  # [B, T, D] -> [B*T, D]
+        else:
+            h_flat = h
+
+        # Apply normalization if needed
         if self.normalize:
-            h = F.normalize(h, p=2, dim=1, eps=1e-6)
+            h_flat_norm = F.normalize(h_flat, p=2, dim=1, eps=1e-6)
             codebook = F.normalize(self.codebook, p=2, dim=1, eps=1e-6)
         else:
+            h_flat_norm = h_flat
             codebook = self.codebook
 
-        # Compute L2
+        # Compute distances
         if self.use_cdist:
-            distances = torch.cdist(h, codebook, p=2) ** 2  # Shape: [B, num_codes]
+            distances = torch.cdist(h_flat_norm, codebook, p=2) ** 2
         else:
-            h_sq = torch.sum(h ** 2, dim=1, keepdim=True)  # [B, 1]
-            codebook_sq = torch.sum(codebook ** 2, dim=1)  # [num_codes]
-            distances = h_sq + codebook_sq - 2 * torch.matmul(h, codebook.t())
+            h_sq = torch.sum(h_flat_norm ** 2, dim=1, keepdim=True)
+            codebook_sq = torch.sum(codebook ** 2, dim=1)
+            distances = h_sq + codebook_sq - 2 * torch.matmul(h_flat_norm, codebook.t())
 
-        # Compute Gumbel-soft assignments with temperature scaling
-        q = F.gumbel_softmax(-distances, tau=self.temperature,hard=False, dim=1) # [B, num_codes]
+        # Compute soft assignments
+        q_flat = F.gumbel_softmax(-distances, tau=self.temperature, hard=False, dim=1)
 
-        # Fix einsum dimension mismatch
-        if q.dim() == 3:  # [B, T, K]
-            q_flat = q.view(-1, q.size(-1))  # [B*T, K]
-            c_tilde = torch.einsum('bk,kd->bd', q_flat, codebook)  # [B*T, D]
-            c_tilde = c_tilde.view(*q.shape[:-1], -1)  # [B, T, D]
-        else:  # Handle 2D case [B, K]
-            c_tilde = torch.einsum('bk,kd->bd', q, codebook)
+        # Compute soft codes
+        c_tilde_flat = torch.einsum('bk,kd->bd', q_flat, codebook)
 
-        # Reshape back for sequence processing
-        if len(original_shape) == 3:
-            q = q.reshape(original_shape[0], original_shape[1], -1)
-            c_tilde = c_tilde.reshape(original_shape[0], original_shape[1], -1)
+        # Hard codebook lookup
+        indices_flat = torch.argmax(q_flat, dim=1)
+        c_hard_flat = codebook[indices_flat]
 
-        # Hard assignments via argmax
-        indices = torch.argmax(q, dim=1)  # [B]  Non-differentiable
-        c_hard = codebook[indices]        # [B, D]
+        # Calculate losses using flat tensors (matching shapes)
+        codebook_loss = F.mse_loss(h_flat_norm.detach(), c_tilde_flat)
+        commitment_loss = F.mse_loss(h_flat_norm, c_tilde_flat.detach())
 
-        # Straight-through estimator: use hard code in forward pass but gradients
-        # flow through c_tilde
-        """Double check"""
+        # Reshape everything back if input was 3D
+        if is_3d:
+            q = q_flat.reshape(original_shape[0], original_shape[1], -1)
+            c_tilde = c_tilde_flat.reshape(original_shape[0], original_shape[1], -1)
+            c_hard = c_hard_flat.reshape(original_shape[0], original_shape[1], -1)
+        else:
+            q = q_flat
+            c_tilde = c_tilde_flat
+            c_hard = c_hard_flat
+
+        # Straight-through estimator
         c_quantized = c_tilde + (c_hard - c_tilde.detach())
 
-        # Stabilized losses
-        codebook_loss = F.mse_loss(h.detach(), c_tilde) # Pulls codebook to embedded h
-        commitment_loss = F.mse_loss(h, c_tilde.detach()) # Push h to codebook
-
-        # Quantization loss: push codebook vectors toward h (with h detached) and commitment loss
         loss = codebook_loss + self.beta * commitment_loss
 
         return q, c_tilde, c_hard, c_quantized, loss

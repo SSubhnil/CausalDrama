@@ -412,6 +412,8 @@ class WorldModel(nn.Module):
             prior_logits, _, _, _ = self.dist_head.forward_prior(modulated_feat, code_emb_tr, u_post)
             prior_sample = self.stright_throught_gradient(prior_logits, sample_mode="random_sample")
             prior_flattened_sample = self.flatten_sample(prior_sample)
+            # Add this line to ensure consistent sequence dimensions
+            prior_flattened_sample = prior_flattened_sample[:, -1:]
         return prior_flattened_sample, last_dist_feat
 
     @profile
