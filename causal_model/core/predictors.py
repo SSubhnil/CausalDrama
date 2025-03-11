@@ -199,7 +199,6 @@ class RewardHead(nn.Module):
             nn.SiLU(inplace=True),
             nn.Linear(hidden_dim, 255) # SymLog discretization
         )
-        self.scale_proj = nn.Linear(num_codes, 1, bias=False) # [B, T, KRe] -> [B, T, 1]
 
     def forward(self, h_modulated, code_emb, q_re):
         """
@@ -235,6 +234,8 @@ class ImprovedRewardHead(RewardHead):
         self.attn = nn.MultiheadAttention(embed_dim=code_dim*2, num_heads=num_heads,
                                           kdim=code_dim, vdim=code_dim)
 
+        # Add projection layer to reduce feature dimension
+        self.attn_proj = nn.Linear(code_dim*2, code_dim)
         self.code_align = nn.Linear(code_dim, code_dim, bias=False)
         nn.init.orthogonal_(self.code_align.weight)
 
@@ -270,17 +271,19 @@ class ImprovedRewardHead(RewardHead):
 
         attn_out = attn_out.transpose(0,1)  # [B, T, D_c]
 
+        # Project down to the dimension expected by the MLP
+        attn_out = self.attn_proj(attn_out)  # [B, T, D_c]
+
         # State-adaptive bin scaling
         scale = self.bin_scaler(h_modulated) # [B, T, 255]
         scaled_bins = self.bin_centers * scale
 
         # Code-dependent logits
         logits = self.mlp(attn_out) # [B, T, 255]
-        reward_pred = (logits.softmax(-1) * scaled_bins).sum(-1)
 
         total_head_loss = (align_loss * self.align_weight) + code_reg
 
-        return reward_pred, total_head_loss # Differentiable bins
+        return logits, total_head_loss # Differentiable bins
 
 class TerminationPredictor(nn.Module):
     def __init__(self, hidden_state_dim, hidden_units, act='SiLU', layer_num=2,

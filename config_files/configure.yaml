@@ -165,7 +165,7 @@ Models:
         AuxiliaryWeight: 0.1
 
       Reward:
-        HiddenDim: 256
+        HiddenDim: 512
         NumHeads: 4
 
       Termination:

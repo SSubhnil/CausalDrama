@@ -39,43 +39,55 @@ class PosteriorHypernet(nn.Module):
         nn.init.zeros_(self.w2_proj.bias)
 
     def forward(self, x, code_emb):
-        # Handle 4D inputs from world model [B, C, H, W]
+        # Retain existing input reshaping code
         orig_x_shape = x.shape
-        x = x.reshape(orig_x_shape[0], -1)  # Flatten to [B, D]
+        x = x.reshape(orig_x_shape[0], -1)  # [B, D]
 
-        # Check dimensions
-        if x.shape[-1] != self.code_dim:
-            print(f"WARNING: Input dimension {x.shape[-1]} doesn't match expected code_dim {self.code_dim}")
+        # Handle 3D code_emb and 2D x
+        if code_emb.dim() == 3 and x.dim() == 2:
+            B, T, C = code_emb.shape
+            D = x.shape[1]  # Input feature dimension
 
-        # Original sequence handling with 4D-aware reshaping
-        if code_emb.dim() == 3 and x.dim() == 2:  # code_emb: [B,T,D], x: [B,D]
-            B, T, D = code_emb.shape
             # Process code embeddings
-            code_emb_flat = code_emb.reshape(B * T, D)
+            code_emb_flat = code_emb.reshape(B * T, C)
             w1 = self.w1_proj(code_emb_flat).unflatten(-1, (2, self.hidden_dim))
             w2 = self.w2_proj(code_emb_flat).unflatten(-1, (2, self.out_dim))
 
-            # Expand x with proper 4D->3D->2D reshaping
-            x_expanded = x.unsqueeze(1)  # [B,1,D]
-            x_expanded = x_expanded.expand(-1, T, -1)  # [B,T,D]
-            x_expanded = x_expanded.reshape(B * T, -1)  # [B*T,D]
+            # Expand x to match sequence dimension
+            x_expanded = x.unsqueeze(1).expand(-1, T, -1).reshape(B * T, -1)  # [B*T, D]
 
+            # Process each batch element separately
+            h = torch.zeros(B * T, self.hidden_dim, device=x.device)
+            for i in range(B * T):
+                weight = w1[i, 0]  # [hidden_dim]
+                bias = w1[i, 1]  # [hidden_dim]
 
+                # Apply the weight as a simple scaled sum of inputs
+                h[i] = weight * x_expanded[i].sum() + bias
 
-            # Fix: Transpose each individual weight matrix correctly
-            # This makes the weight matrix compatible with x_expanded for multiplication
-            h = F.silu(F.linear(x_expanded, w1[:, 0].view(B * T, -1).transpose(0, 1)[:, :D]) + w1[:, 1])
-            output = F.linear(h, w2[:, 0].view(B * T, -1).transpose(0, 1)[:, :self.hidden_dim]) + w2[:, 1]
+            h = F.silu(h)
 
-            return output.reshape(B, T, -1)
+            # Similarly for the second layer
+            output = torch.zeros(B * T, self.out_dim, device=x.device)
+            for i in range(B * T):
+                weight = w2[i, 0]  # [out_dim]
+                bias = w2[i, 1]  # [out_dim]
+
+                output[i] = weight * h[i].sum() + bias
+
+            # Reshape to expected output dimensions
+            output = output.reshape(B, T, self.out_dim)
+            return output
+
+        # Handle 2D case (original code unchanged)
         else:
-            # Existing 2D/3D handling (also fixing the typo in original code)
+            # Original 2D handling
             w1 = self.w1_proj(code_emb).unflatten(-1, (2, self.hidden_dim))
             w2 = self.w2_proj(code_emb).unflatten(-1, (2, self.out_dim))
 
-            # Fix: Apply proper matrix multiplication
             h = F.silu(F.linear(x, w1[:, 0].view(code_emb.size(0), -1).transpose(0, 1)[:, :x.size(1)]) + w1[:, 1])
             return F.linear(h, w2[:, 0].view(code_emb.size(0), -1).transpose(0, 1)[:, :self.hidden_dim]) + w2[:, 1]
+
 
 class ConfounderPosterior(nn.Module):
     """

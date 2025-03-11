@@ -12,7 +12,7 @@ from sub_models.laprop import LaProp
 from pytorch_warmup import LinearWarmup
 # from nfnets import AGC
 
-from sub_models.functions_losses import SymLogTwoHotLoss
+from sub_models.functions_losses import SymLogTwoHotLoss, symlog
 from sub_models.attention_blocks import get_subsequent_mask_with_batch_length, get_subsequent_mask
 from sub_models.transformer_model import StochasticTransformerKVCache
 from mamba_ssm import MambaWrapperModel, MambaConfig, InferenceParams, update_graph_cache
@@ -617,7 +617,7 @@ class WorldModel(nn.Module):
                 dist_feat = get_hidden_state(sample_list[-1], action_list[-1], inference_params)
                 mod_dist_feat, _ = self.causal_model.state_modulator(dist_feat, quantizer_output['hard_tr'], u)
                 dist_feat_list.append(mod_dist_feat)
-                self.dist_feat_buffer[:, i+1:i+2] = mod_dist_feat
+                self.dist_feat_buffer[:, i+1:i+2] = mod_dist_feat[:, -1:, :]
                 inference_params.seqlen_offset += sample_list[-1].shape[1]
                 # if repetition_penalty == 1.0:
                 #     sampled_tokens = sample_tokens(scores[-1], inference_params)
@@ -688,13 +688,14 @@ class WorldModel(nn.Module):
 
             # decoding reward and termination with dist_feat
             reward_hat, re_head_loss = self.reward_decoder(mod_dist_feat, quantizer_output['quantized_re'], quantizer_output['q_re'])
+            reward_decoded = self.symlog_twohot_loss_func.decode(reward_hat) # Convert to scalar values
             termination_hat = self.termination_decoder(mod_dist_feat)
 
             """Model losses from causal model"""
             # env loss
             pred_loss = 0.1 * inv_loss + 0.01 * aux_loss + 0.05 * sparsity_loss
             reconstruction_loss = self.mse_loss_func(obs_hat[:batch_size], obs[:batch_size])
-            reward_loss = self.symlog_twohot_loss_func(reward_hat, reward)
+            reward_loss = F.mse_loss(reward_decoded, symlog(reward))
             termination_loss = self.bce_with_logits_loss_func(termination_hat, termination)
             # dyn-rep loss
             # pred_loss = (self.loss_weights['tr_aux_loss'] * aux_loss) + (
