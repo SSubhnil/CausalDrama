@@ -4,8 +4,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 class StateModulator(nn.Module):
     """Dedicated module for hidden state modulation based on causal factors."""
+
     def __init__(self, hidden_state_dim, hidden_dim, code_dim, conf_dim):
         super().__init__()
 
@@ -43,6 +45,7 @@ class StateModulator(nn.Module):
         self.register_buffer('step', torch.tensor(0))
 
     def forward(self, h, code_emb, u, compute_invariance_loss=False):
+        # print(f"STATE MODULATOR INPUT: h={h.shape}, code_emb={code_emb.shape}, u={u.shape}")
         # Concatenate code and confounder
         code_emb_stable = code_emb.detach()  # Blocks gradients to codebook
         modulation_input = torch.cat([code_emb_stable, u], dim=-1)
@@ -52,8 +55,18 @@ class StateModulator(nn.Module):
         scale = self.scale_mlp(modulation_input)  # Detach world model
         shift = self.shift_mlp(modulation_input)
 
+        # Verify dimensions before applying transformation
+        assert h.shape[0] == scale.shape[0], f"Batch dim mismatch: h={h.shape[0]}, scale={scale.shape[0]}"
+        assert h.shape[1] == scale.shape[1], f"Seq dim mismatch: h={h.shape[1]}, scale={scale.shape[1]}"
+
         # Modulated hidden state
         h_transformed = self.proj_w(h)  # W from doc
+
+        # In StateModulator.forward method
+        # print(f"h shape: {h.shape}, device: {h.device}")
+        # print(f"code_emb shape: {code_emb.shape}, device: {code_emb.device}")
+        # print(f"weight shape: {self.proj_w[0].weight.shape}, device: {self.proj_w[0].weight.device}")
+
         h_modulated = scale * h_transformed + shift
 
         # Compute invariance loss if requested (during training)
@@ -70,15 +83,17 @@ class StateModulator(nn.Module):
             self.step += 1
             self.sigma.data = torch.max(
                 torch.tensor(self.sigma_min),
-                self.sigma * self.sigma_decay ** (self.step/100)
+                self.sigma * self.sigma_decay ** (self.step / 100)
             )
+        # print(f"STATE MODULATOR OUTPUT: h_modulated={h_modulated.shape}")
 
         return h_modulated, inv_loss
 
 
 class MoETransitionHead(nn.Module):
-    def __init__(self, hidden_state_dim, hidden_dim, code_dim, conf_dim, num_experts, top_k, state_modulator, quantizer, compute_inv_loss=False,
-    use_importance_weighted_moe=True, importance_reg=0.01):
+    def __init__(self, hidden_state_dim, hidden_dim, code_dim, conf_dim, num_experts, top_k, state_modulator, quantizer,
+                 compute_inv_loss=False,
+                 use_importance_weighted_moe=True, importance_reg=0.01):
         super().__init__()
 
         # Choose between SparseCodeookMoE or FeatureImportanceWeightedMoE
@@ -107,7 +122,6 @@ class MoETransitionHead(nn.Module):
                                          quantizer=self.quantizer,
                                          top_k=self.predictor_params.Transition.TopK,
                                          )
-    
 
         # Confounding effect module
         # self.conf_mask = nn.Parameter(torch.zeros(hidden_dim))
@@ -125,13 +139,11 @@ class MoETransitionHead(nn.Module):
 
         # Final Projection layer to Next-state logits
         # Output from SparseCodebookMoE is a 1024 projection, but not logits
-        self.final_proj = nn.Sequential(nn.Linear(1024, 1024*2),
+        self.final_proj = nn.Sequential(nn.Linear(1024, 1024 * 2),
                                         nn.Mish(),
-                                        nn.Linear(1024*2, 1024),
+                                        nn.Linear(1024 * 2, 1024),
                                         nn.Tanh()  # Maintains bounded outputs while allowing density learning
                                         )
-
-
 
         """Replace with learnable sparsity mask"""
         # Initialize sparse mask - may not be as flexible as a fully learable mask
@@ -146,12 +158,13 @@ class MoETransitionHead(nn.Module):
         code_emb_stable = code_emb.detach()
 
         # Ensure compatible dimensions
-        if code_emb_stable.shape[1] != u.shape[1]:
-            if code_emb_stable.shape[1] == 1:
-                code_emb_stable = code_emb_stable.expand(-1, u.shape[1], -1)
-            elif u.shape[1] == 1:
-                u = u.expand(-1, code_emb_stable.shape[1], -1)
-
+        # if code_emb_stable.shape[1] != u.shape[1]:
+        #     if code_emb_stable.shape[1] == 1:
+        #         code_emb_stable = code_emb_stable.expand(-1, u.shape[1], -1)
+        #     elif u.shape[1] == 1:
+        #         u = u.expand(-1, code_emb_stable.shape[1], -1)
+        print("weighted_h shape in MoETransitionHead:", h_modulated.shape)
+        print("code_emb shape in MoETransitionHead:", code_emb_stable.shape)
         # Process through MoE
         moe_out, aux_loss, importance_stats = self.moe(h_modulated, code_emb_stable)
 
@@ -185,7 +198,7 @@ class MoETransitionHead(nn.Module):
         if self.use_importance_weighted_moe:
             temperature = torch.clamp(self.moe.importance_temperature, min=0.1, max=5.0)
             weights = [F.softmax(self.moe.feature_importance[i] / temperature, dim=0).detach().cpu()
-            for i in range(self.moe.num_experts)]
+                       for i in range(self.moe.num_experts)]
             return weights
         return None
 
@@ -197,7 +210,7 @@ class RewardHead(nn.Module):
         self.mlp = nn.Sequential(
             nn.Linear(code_dim, hidden_dim),
             nn.SiLU(inplace=True),
-            nn.Linear(hidden_dim, 255) # SymLog discretization
+            nn.Linear(hidden_dim, 255)  # SymLog discretization
         )
 
     def forward(self, h_modulated, code_emb, q_re):
@@ -206,10 +219,10 @@ class RewardHead(nn.Module):
         q_re: [B, T, KRe] soft code weights
         """
         # Base reward prediction
-        base_reward = self.mlp(code_emb) # [B, T, 255]
+        base_reward = self.mlp(code_emb)  # [B, T, 255]
 
         # Code-specific scaling
-        code_weights = self.scale_proj(q_re.transpose(-1, -2)) # [B, T, 1]
+        code_weights = self.scale_proj(q_re.transpose(-1, -2))  # [B, T, 1]
         scaled_reward = base_reward * code_weights.sigmoid()
 
         # From causal model
@@ -218,6 +231,7 @@ class RewardHead(nn.Module):
         # total_loss += reward_loss + code_reg
 
         return scaled_reward
+
 
 class ImprovedRewardHead(RewardHead):
     def __init__(self, num_codes, code_dim, hidden_state_dim, num_heads=4, hidden_dim=256,
@@ -231,16 +245,16 @@ class ImprovedRewardHead(RewardHead):
         self.state_proj = nn.Sequential(nn.Linear(hidden_state_dim, code_dim),
                                         nn.SiLU())
         # Cross-codebook attention
-        self.attn = nn.MultiheadAttention(embed_dim=code_dim*2, num_heads=num_heads,
+        self.attn = nn.MultiheadAttention(embed_dim=code_dim * 2, num_heads=num_heads,
                                           kdim=code_dim, vdim=code_dim)
 
         # Add projection layer to reduce feature dimension
-        self.attn_proj = nn.Linear(code_dim*2, code_dim)
+        self.attn_proj = nn.Linear(code_dim * 2, code_dim)
         self.code_align = nn.Linear(code_dim, code_dim, bias=False)
         nn.init.orthogonal_(self.code_align.weight)
 
         # Learnable bins with modulated scaling
-        self.bin_centers = nn.Parameter(torch.linspace(-10,10,255)) # Learnable
+        self.bin_centers = nn.Parameter(torch.linspace(-10, 10, 255))  # Learnable
         self.bin_scaler = nn.Sequential(nn.Linear(hidden_state_dim, 255),
                                         nn.Sigmoid())
 
@@ -252,11 +266,11 @@ class ImprovedRewardHead(RewardHead):
         """
         # Project modulated state to code space
         # h_modulated = h_modulated.detach() # Avoids gradient flow into world model,
-                                             # but the world model may fail to learn.
-        state_proj = self.state_proj(h_modulated) # [B, T, D_c]
+        # but the world model may fail to learn.
+        state_proj = self.state_proj(h_modulated)  # [B, T, D_c]
 
         # Create attention query from state-code fusion
-        query = torch.cat([state_proj, code_emb], -1) # [B, T, 2D_c]
+        query = torch.cat([state_proj, code_emb], -1)  # [B, T, 2D_c]
 
         # Code alignmengt loss - enforce alignment between state projection and codes
         align_loss = F.mse_loss(state_proj, self.code_align(code_emb))
@@ -265,25 +279,26 @@ class ImprovedRewardHead(RewardHead):
         code_reg = q_re.pow(2).mean() * self.code_reg_weight
 
         # Attend to aligned codebook entries
-        attn_out, _ = self.attn(query.transpose(0,1),
-                                key=self.code_align(code_emb).transpose(0,1),
-                                value=code_emb.transpose(0,1))
+        attn_out, _ = self.attn(query.transpose(0, 1),
+                                key=self.code_align(code_emb).transpose(0, 1),
+                                value=code_emb.transpose(0, 1))
 
-        attn_out = attn_out.transpose(0,1)  # [B, T, D_c]
+        attn_out = attn_out.transpose(0, 1)  # [B, T, D_c]
 
         # Project down to the dimension expected by the MLP
         attn_out = self.attn_proj(attn_out)  # [B, T, D_c]
 
         # State-adaptive bin scaling
-        scale = self.bin_scaler(h_modulated) # [B, T, 255]
+        scale = self.bin_scaler(h_modulated)  # [B, T, 255]
         scaled_bins = self.bin_centers * scale
 
         # Code-dependent logits
-        logits = self.mlp(attn_out) # [B, T, 255]
+        logits = self.mlp(attn_out)  # [B, T, 255]
 
         total_head_loss = (align_loss * self.align_weight) + code_reg
 
-        return logits, total_head_loss # Differentiable bins
+        return logits, total_head_loss  # Differentiable bins
+
 
 class TerminationPredictor(nn.Module):
     def __init__(self, hidden_state_dim, hidden_units, act='SiLU', layer_num=2,
@@ -294,7 +309,7 @@ class TerminationPredictor(nn.Module):
         # Optional hidden state projection (if dimensions need adjustment)
         self.h_proj = nn.Sequential(nn.Linear(hidden_state_dim,
                                               hidden_units),
-                                    nn.LayerNorm(hidden_units) # Normalization for stability
+                                    nn.LayerNorm(hidden_units)  # Normalization for stability
                                     )
 
         # Create a backbone with dynamic number of layers
@@ -306,7 +321,7 @@ class TerminationPredictor(nn.Module):
             # Using LayerNorm instead of RMSNorm for compatibility
             layers.append(nn.LayerNorm(hidden_units, dtype=dtype))
             layers.append(act_fn())
-            layers.append(nn.Dropout(dropout)) # Add dropout for regularization
+            layers.append(nn.Dropout(dropout))  # Add dropout for regularization
 
         self.backbone = nn.Sequential(*layers)
         self.head = nn.Linear(hidden_units, 1, dtype=dtype, device=device)
@@ -334,6 +349,6 @@ class TerminationPredictor(nn.Module):
 
         # Final prediction
         termination = self.head(feat)
-        termination = termination.squeeze(-1) #  Remove last dimension
+        termination = termination.squeeze(-1)  # Remove last dimension
 
         return termination

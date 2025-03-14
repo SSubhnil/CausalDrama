@@ -27,7 +27,7 @@ JointTrainAgent:
   NumEnvs: 1
   BatchSize: 16
   BatchLength: 128
-  ImagineBatchSize: 1024
+  ImagineBatchSize: 512
   ImagineContextLength: 8
   ImagineBatchLength: 16
   RealityContextLength: 16

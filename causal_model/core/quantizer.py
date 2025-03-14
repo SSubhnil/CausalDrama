@@ -86,6 +86,7 @@ class VQQuantizer(nn.Module):
             c_tilde = c_tilde_flat.reshape(original_shape[0], original_shape[1], -1)
             c_hard = c_hard_flat.reshape(original_shape[0], original_shape[1], -1)
         else:
+            # Unsqueeze to add sequence dimension for 2D inputs
             q = q_flat
             c_tilde = c_tilde_flat
             c_hard = c_hard_flat

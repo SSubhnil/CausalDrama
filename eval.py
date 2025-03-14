@@ -33,6 +33,12 @@ def build_single_env(env_name, image_size):
 
 
 def build_vec_env(env_name, image_size, num_envs):
+    # Add this line to force PyTorch tensors for observations
+    # gymnasium.register(
+    #     "ALE/Pong-v5",
+    #     lambda: gymnasium.make("ALE/Pong-v5", render_mode="rgb_array"),
+    #     vector_kwargs={'dtype': torch.float32, 'device': 'cuda'}
+    # )
     # lambda pitfall refs to: https://python.plainenglish.io/python-pitfalls-with-variable-capture-dcfc113f39b7
     def lambda_generator(env_name, image_size):
         return lambda: build_single_env(env_name, image_size)
