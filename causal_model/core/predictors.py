@@ -45,6 +45,14 @@ class StateModulator(nn.Module):
         self.register_buffer('step', torch.tensor(0))
 
     def forward(self, h, code_emb, u, compute_invariance_loss=False):
+        if h.shape[1] != code_emb.shape[1]:
+            if h.shape[1] < code_emb.shape[1]:
+                # Extract the last sequence element from code_emb and u
+                if h.shape[1] == 1:
+                    # Most common case: h has a single sequence element
+                    code_emb = code_emb[:, -1:, :]  # Take last element and keep dim
+                    u = u[:, -1:, :]  # Same for u
+            # No need for else case as we're focusing on adapting code_emb
         # print(f"STATE MODULATOR INPUT: h={h.shape}, code_emb={code_emb.shape}, u={u.shape}")
         # Concatenate code and confounder
         code_emb_stable = code_emb.detach()  # Blocks gradients to codebook
@@ -163,8 +171,8 @@ class MoETransitionHead(nn.Module):
         #         code_emb_stable = code_emb_stable.expand(-1, u.shape[1], -1)
         #     elif u.shape[1] == 1:
         #         u = u.expand(-1, code_emb_stable.shape[1], -1)
-        print("weighted_h shape in MoETransitionHead:", h_modulated.shape)
-        print("code_emb shape in MoETransitionHead:", code_emb_stable.shape)
+        # print("weighted_h shape nsitionHead:", h_modulated.shape)
+        # print("code_emb shape in MoETransiin MoETrationHead:", code_emb_stable.shape)
         # Process through MoE
         moe_out, aux_loss, importance_stats = self.moe(h_modulated, code_emb_stable)
 
@@ -234,29 +242,42 @@ class RewardHead(nn.Module):
 
 
 class ImprovedRewardHead(RewardHead):
-    def __init__(self, num_codes, code_dim, hidden_state_dim, num_heads=4, hidden_dim=256,
+    def __init__(self, num_codes, code_dim, hidden_state_dim, hidden_dim=256,
                  align_weight=0.05, code_reg_weight=0.01):
         super().__init__(num_codes, code_dim, hidden_dim)
-
         self.align_weight = align_weight
         self.code_reg_weight = code_reg_weight
 
-        # For the h_modulated
-        self.state_proj = nn.Sequential(nn.Linear(hidden_state_dim, code_dim),
-                                        nn.SiLU())
-        # Cross-codebook attention
-        self.attn = nn.MultiheadAttention(embed_dim=code_dim * 2, num_heads=num_heads,
-                                          kdim=code_dim, vdim=code_dim)
+        # Project modulated state to code space
+        self.state_proj = nn.Sequential(
+            nn.Linear(hidden_state_dim, code_dim),
+            nn.SiLU()
+        )
 
-        # Add projection layer to reduce feature dimension
-        self.attn_proj = nn.Linear(code_dim * 2, code_dim)
+        # Code alignment (preserved from original)
         self.code_align = nn.Linear(code_dim, code_dim, bias=False)
         nn.init.orthogonal_(self.code_align.weight)
 
-        # Learnable bins with modulated scaling
-        self.bin_centers = nn.Parameter(torch.linspace(-10, 10, 255))  # Learnable
-        self.bin_scaler = nn.Sequential(nn.Linear(hidden_state_dim, 255),
-                                        nn.Sigmoid())
+        # Feature fusion MLP (replaces attention mechanism)
+        self.feature_fusion = nn.Sequential(
+            nn.Linear(code_dim * 2, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, code_dim)
+        )
+
+        # Bin scaling (preserved from original)
+        self.bin_centers = nn.Parameter(torch.linspace(-10, 10, 255))
+        self.bin_scaler = nn.Sequential(
+            nn.Linear(hidden_state_dim, 255),
+            nn.Sigmoid()
+        )
+
+        # Final prediction MLP
+        self.mlp = nn.Sequential(
+            nn.Linear(code_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 255)
+        )
 
     def forward(self, h_modulated, code_emb, q_re):
         """
@@ -265,39 +286,32 @@ class ImprovedRewardHead(RewardHead):
         q_re: [B,T,K] - code weights
         """
         # Project modulated state to code space
-        # h_modulated = h_modulated.detach() # Avoids gradient flow into world model,
-        # but the world model may fail to learn.
-        state_proj = self.state_proj(h_modulated)  # [B, T, D_c]
+        state_proj = self.state_proj(h_modulated)
 
-        # Create attention query from state-code fusion
-        query = torch.cat([state_proj, code_emb], -1)  # [B, T, 2D_c]
+        # Apply code alignment
+        aligned_code_emb = self.code_align(code_emb)
 
-        # Code alignmengt loss - enforce alignment between state projection and codes
-        align_loss = F.mse_loss(state_proj, self.code_align(code_emb))
+        # Calculate alignment loss (same as original)
+        align_loss = F.mse_loss(state_proj, aligned_code_emb)
 
-        # Code sparsity regularization
+        # Code sparsity regularization (same as original)
         code_reg = q_re.pow(2).mean() * self.code_reg_weight
 
-        # Attend to aligned codebook entries
-        attn_out, _ = self.attn(query.transpose(0, 1),
-                                key=self.code_align(code_emb).transpose(0, 1),
-                                value=code_emb.transpose(0, 1))
+        # Fuse features with simple concatenation + MLP instead of attention
+        fused_features = torch.cat([state_proj, aligned_code_emb], dim=-1)
+        fused_features = self.feature_fusion(fused_features)
 
-        attn_out = attn_out.transpose(0, 1)  # [B, T, D_c]
-
-        # Project down to the dimension expected by the MLP
-        attn_out = self.attn_proj(attn_out)  # [B, T, D_c]
-
-        # State-adaptive bin scaling
-        scale = self.bin_scaler(h_modulated)  # [B, T, 255]
+        # Generate bin scaling (same as original)
+        scale = self.bin_scaler(h_modulated)
         scaled_bins = self.bin_centers * scale
 
-        # Code-dependent logits
-        logits = self.mlp(attn_out)  # [B, T, 255]
+        # Final prediction
+        logits = self.mlp(fused_features)
 
+        # Total head loss (same as original)
         total_head_loss = (align_loss * self.align_weight) + code_reg
 
-        return logits, total_head_loss  # Differentiable bins
+        return logits, total_head_loss
 
 
 class TerminationPredictor(nn.Module):

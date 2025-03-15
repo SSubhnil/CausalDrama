@@ -506,6 +506,7 @@ class WorldModel(nn.Module):
             scalar_size = (imagine_batch_size, imagine_batch_length)
             self.sample_buffer = torch.zeros(latent_size, dtype=dtype, device=device)
             self.dist_feat_buffer = torch.zeros(hidden_size, dtype=dtype, device=device)
+            self.unmod_dist_feat_buffer = torch.zeros_like(self.dist_feat_buffer)
             self.action_buffer = torch.zeros(scalar_size, dtype=dtype, device=device)
             self.reward_hat_buffer = torch.zeros(scalar_size, dtype=dtype, device=device)
             self.termination_hat_buffer = torch.zeros(scalar_size, dtype=dtype, device=device)
@@ -612,7 +613,10 @@ class WorldModel(nn.Module):
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp and not self.use_cg):
             context_dist_feat = get_hidden_state(context_latent, sample_action, inference_params)
             inference_params.seqlen_offset += context_dist_feat.shape[1]
+            # Unmodulated Context Dist Feat
+            self.unmod_dist_feat_buffer[:, 0:1] = context_dist_feat[:, -1:]
 
+            # Modulated Context Dist Feat
             quantizer_output, u, _ = self.causal_model(context_dist_feat)
             mod_context_dist_feat, _ = self.causal_model.state_modulator(context_dist_feat, quantizer_output['hard_tr'],
                                                                          u)
@@ -633,11 +637,14 @@ class WorldModel(nn.Module):
                 self.action_buffer[:, i:i + 1] = action
                 old_logits_list.append(logits)
                 dist_feat = get_hidden_state(sample_list[-1], action_list[-1], inference_params)
+                # Store unmodulated
+                self.unmod_dist_feat_buffer[:, i + 1:i + 2] = dist_feat[:, -1:, :].detach()
 
+                # Process and store modulated
                 quantizer_output_x, u_x, _ = self.causal_model(dist_feat)
                 dist_feat, _ = self.causal_model.state_modulator(dist_feat, quantizer_output_x['hard_tr'], u_x)
                 dist_feat_list.append(dist_feat)
-                self.dist_feat_buffer[:, i + 1:i + 2] = dist_feat[:, -1:, :]
+                self.dist_feat_buffer[:, i + 1:i + 2] = dist_feat[:, -1:, :].detach()
                 inference_params.seqlen_offset += sample_list[-1].shape[1]
                 # if repetition_penalty == 1.0:
                 #     sampled_tokens = sample_tokens(scores[-1], inference_params)
@@ -660,11 +667,12 @@ class WorldModel(nn.Module):
             # dist_feat_tensor = torch.cat(dist_feat_list, dim=1)
             # action_tensor = torch.cat(action_list, dim=1)
             old_logits_tensor = torch.cat(old_logits_list, dim=1)
-
-            reward_hat_tensor, _ = self.reward_decoder(self.dist_feat_buffer[:, :-1], quantizer_output['hard_re'],
-                                                       quantizer_output['q_re'])
+            quantizer_output_re, u_re, _ = self.causal_model(self.unmod_dist_feat_buffer[:, :-1])
+            mod_dist_feat, _ = self.causal_model.state_modulator(self.unmod_dist_feat_buffer[:, :-1], quantizer_output_re['hard_tr'], u_re)
+            reward_hat_tensor, _ = self.reward_decoder(mod_dist_feat, quantizer_output_re['hard_re'],
+                                                       quantizer_output_re['q_re'])
             self.reward_hat_buffer = self.symlog_twohot_loss_func.decode(reward_hat_tensor)
-            termination_hat_tensor = self.termination_decoder(self.dist_feat_buffer[:, :-1])
+            termination_hat_tensor = self.termination_decoder(mod_dist_feat)
             self.termination_hat_buffer = termination_hat_tensor > 0
 
             if log_video:
