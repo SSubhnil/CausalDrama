@@ -172,7 +172,8 @@ class ConfounderPosterior(nn.Module):
 
         with torch.autocast(device_type='cuda', dtype=torch.float16):
             # Generate posterior parameters
-            mu_post = self.confounder_post_mu_net(h, code_emb)
+            # mu_post = self.confounder_post_mu_net(h, code_emb)
+            mu_post = torch.clamp(self.confounder_post_mu_net(h, code_emb), min=-10.0, max=10.0)
             self.check_dimensions(mu_post, (mu_post.size(0), mu_post.size(1), self.conf_dim), "mu_post")
 
             logvar_post = self.confounder_post_logvar_net(h, code_emb)
@@ -204,13 +205,16 @@ class ConfounderPosterior(nn.Module):
 
         return l2_reg, code_sparsity
 
-    def gaussian_KL(self, mu_post: torch.Tensor, logvar_post: torch.Tensor,
-                    mu_prior: torch.Tensor, logvar_prior: torch.Tensor):
-        return 0.5 * (
-                (logvar_prior - logvar_post) +
-                (torch.exp(logvar_post) + (mu_post - mu_prior) ** 2) /
-                torch.exp(logvar_prior) - 1
-        ).sum(1).mean()
+    def gaussian_KL(self, mu_post, logvar_post, mu_prior, logvar_prior):
+        # Add numerical stability
+        var_post = torch.exp(logvar_post).clamp(min=1e-5)
+        var_prior = torch.exp(logvar_prior).clamp(min=1e-5)
+
+        kl_div = 0.5 * (
+                logvar_prior - logvar_post +
+                (var_post + (mu_post - mu_prior) ** 2) / var_prior - 1
+        )
+        return kl_div.sum(1).mean()
 
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5*logvar).clamp_min(self._eps)

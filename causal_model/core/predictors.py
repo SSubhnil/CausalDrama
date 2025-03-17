@@ -44,7 +44,7 @@ class StateModulator(nn.Module):
         self.sigma_decay = 0.9995
         self.register_buffer('step', torch.tensor(0))
 
-    def forward(self, h, code_emb, u, compute_invariance_loss=False):
+    def forward(self, h, code_emb, u, global_step, compute_invariance_loss=False):
         if h.shape[1] != code_emb.shape[1]:
             if h.shape[1] < code_emb.shape[1]:
                 # Extract the last sequence element from code_emb and u
@@ -55,7 +55,10 @@ class StateModulator(nn.Module):
             # No need for else case as we're focusing on adapting code_emb
         # print(f"STATE MODULATOR INPUT: h={h.shape}, code_emb={code_emb.shape}, u={u.shape}")
         # Concatenate code and confounder
-        code_emb_stable = code_emb.detach()  # Blocks gradients to codebook
+        if global_step < 1033:
+            code_emb_stable = code_emb.detach()  # Blocks gradients to codebook
+        else:
+            code_emb_stable = code_emb
         modulation_input = torch.cat([code_emb_stable, u], dim=-1)
 
         # Generate scale/shift with gradient gates
@@ -163,14 +166,8 @@ class MoETransitionHead(nn.Module):
 
     def forward(self, h_modulated, code_emb, u):
         # Get stable code embeddings
-        code_emb_stable = code_emb.detach()
+        code_emb_stable = code_emb  # .detach()
 
-        # Ensure compatible dimensions
-        # if code_emb_stable.shape[1] != u.shape[1]:
-        #     if code_emb_stable.shape[1] == 1:
-        #         code_emb_stable = code_emb_stable.expand(-1, u.shape[1], -1)
-        #     elif u.shape[1] == 1:
-        #         u = u.expand(-1, code_emb_stable.shape[1], -1)
         # print("weighted_h shape nsitionHead:", h_modulated.shape)
         # print("code_emb shape in MoETransiin MoETrationHead:", code_emb_stable.shape)
         # Process through MoE
