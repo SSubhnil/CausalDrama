@@ -154,30 +154,44 @@ class CausalModel(nn.Module):
             code_emb_tr = quant_output_dict['quantized_tr']
             quant_loss = quant_output_dict['loss']
 
-            # Confounder prior network calculations with all losses
-            mu_prior, logvar_prior = self.confounder_prior_net(h_proj_tr.detach(),
-                                                               code_ids=quant_output_dict['hard_tr'].argmax(-1))
-            prior_code_alignment_loss = self.confounder_prior_net.code_alignment_loss() * self.loss_weights[
-                'prior_code_align']
-            prior_reg_loss = self.confounder_prior_net.prior_regularization(mu_prior) * self.loss_weights[
-                'prior_reg_weight']
+            if global_step % 3 == 0:  # Prior phase
+                # Freeze posterior gradients but compute values
+                with torch.no_grad():
+                    # Confounder prior network calculations with all losses
+                    mu_prior, logvar_prior = self.confounder_prior_net(h_proj_tr,
+                                                                       code_ids=quant_output_dict['hard_tr'].argmax(-1))
+                    # Confounder posterior with KL loss
+                    u_post, _, _ = self.confounder_post_net(h_proj_tr, code_emb_tr)
 
-            # Confounder posterior with KL loss
-            u_post, kl_loss = self.confounder_post_net(h_proj_tr, code_emb_tr,
-                                                       mu_prior.detach(), logvar_prior.detach())
+                prior_code_alignment_loss = self.confounder_prior_net.code_alignment_loss() * self.loss_weights[
+                    'prior_code_align']
+                prior_reg_loss = self.confounder_prior_net.prior_regularization(mu_prior) * self.loss_weights[
+                    'prior_reg_weight']
+                # For phased training, return only prior-related components
+                confounder_loss = prior_code_alignment_loss + prior_reg_loss
 
-            # Regularization losses
-            post_l2_reg, post_sparsity = self.confounder_post_net.regularization_loss()
-            post_l2_reg = post_l2_reg * self.loss_weights['post_reg']
-            post_sparsity = post_sparsity * self.loss_weights['post_sparsity']
-            kl_loss = kl_loss * self.loss_weights['kl_loss_weight']
+            else:  # Posterior phase
+                # Compute prior but detach gradients
+                with torch.no_grad():
+                    mu_prior, logvar_prior = self.confounder_prior_net(h_proj_tr.detach(),
+                                                                       code_ids=quant_output_dict['hard_tr'].argmax(-1))
+                    # Allow gradients for posterior
+                    u_post, mu_post, logvar_post = self.confounder_post_net(h_proj_tr, code_emb_tr)
+                    kl_loss = self.confounder_post_net.gaussian_KL(mu_post, logvar_post, mu_prior.detach(),
+                                                                   logvar_prior.detach())
+                    # Regularization losses
+                    post_l2_reg, post_sparsity = self.confounder_post_net.regularization_loss()
+                    post_l2_reg = post_l2_reg * self.loss_weights['post_reg']
+                    post_sparsity = post_sparsity * self.loss_weights['post_sparsity']
+                    kl_loss = kl_loss * self.loss_weights['kl_loss_weight']
+
+                    # For phased training, return only posterior-related components
+                    confounder_loss = kl_loss + post_l2_reg + post_sparsity
 
             # Combine all losses
-            confounder_loss = prior_code_alignment_loss + prior_reg_loss + post_l2_reg + \
-                              post_sparsity + kl_loss
             causal_loss = quant_loss + confounder_loss
-
             return quant_output_dict, u_post, causal_loss
+
         else:  # Inference
             # Optimized inference path - skip unnecessary computations
             quant_output_dict = self.quantizer(h_proj_tr, h_proj_re, training=False)
@@ -201,4 +215,3 @@ class CausalModel(nn.Module):
 
             # Reparameterize
             return self.confounder_post_net.reparameterize(mu_post, logvar_post)
-

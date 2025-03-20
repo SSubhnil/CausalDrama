@@ -172,7 +172,7 @@ class ConfounderPosterior(nn.Module):
         return True
 
     @profile
-    def forward(self, h: torch.Tensor, code_emb, mu_prior, logvar_prior):
+    def forward(self, h: torch.Tensor, code_emb):
         """
         Args:
             h: Hidden state projection from encoder
@@ -195,9 +195,8 @@ class ConfounderPosterior(nn.Module):
 
             # Reparameterization trick
             u_post = self.reparameterize(mu_post, logvar_post)
-            kl_loss = self.gaussian_KL(mu_post, logvar_post, mu_prior.detach(), logvar_prior.detach())
 
-            return u_post, kl_loss
+            return u_post, mu_post, logvar_post
 
     # REDUNDANT due to non-use of scale and shift
     def regularization_loss_2(self, lamdba_weight=0.01):

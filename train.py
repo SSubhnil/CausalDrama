@@ -1,6 +1,6 @@
 import os
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 import gymnasium
 import argparse
 import numpy as np
@@ -59,7 +59,7 @@ def monitor_memory_growth(steps_history=100):
     return current_mem
 
 
-@profile
+
 def train_world_model_step(replay_buffer: ReplayBuffer, world_model: WorldModel, batch_size, batch_length, logger,
                            epoch, global_step):
     epoch_reconstruction_loss_list = []
@@ -70,7 +70,22 @@ def train_world_model_step(replay_buffer: ReplayBuffer, world_model: WorldModel,
     epoch_representation_loss_list = []
     epoch_representation_real_kl_div_list = []
     epoch_total_loss_list = []
-    for e in range(epoch):
+
+    # Determine if using phased training and which phase we're in
+    if world_model.use_phased_training:
+        # 0 = world model phase, 1 = causal model phase
+        current_phase = (global_step // world_model.alternation_frequency) % 2
+
+        # Adjust number of epochs based on phase
+        actual_epochs = epoch * world_model.phase_multiplier
+
+        # Log current training phase
+        if logger is not None:
+            logger.log("Training/Phase", current_phase, global_step=global_step)
+    else:
+        actual_epochs = epoch
+
+    for e in range(actual_epochs):
         obs, action, reward, termination = replay_buffer.sample(batch_size, batch_length, imagine=False)
         reconstruction_loss, reward_loss, termination_loss, \
             dynamics_loss, dynamics_real_kl_div, representation_loss, \
@@ -99,7 +114,7 @@ def train_world_model_step(replay_buffer: ReplayBuffer, world_model: WorldModel,
         logger.log("WorldModel/total_loss", np.mean(epoch_total_loss_list), global_step=global_step)
 
 
-@profile
+
 @torch.no_grad()
 def world_model_imagine_data(replay_buffer: ReplayBuffer,
                              world_model: WorldModel, agent: agents.ActorCriticAgent,
@@ -132,7 +147,7 @@ def world_model_imagine_data(replay_buffer: ReplayBuffer,
     return latent, action, old_logits, context_latent, sample_reward, sample_termination, reward_hat, termination_hat
 
 
-@profile
+
 def joint_train_world_model_agent(config, logdir,
                                   replay_buffer: ReplayBuffer,
                                   world_model: WorldModel, agent: agents.ActorCriticAgent,
@@ -207,14 +222,15 @@ def joint_train_world_model_agent(config, logdir,
         if is_last:
             logger.log(f"episode/score", sum_reward, global_step=total_steps)
             logger.log(f"episode/length", info["episode_frame_number"], global_step=total_steps)  # framskip=4
-            if config.BasicSettings.Env_name.startswith('ALE') and game_benchmark_df is not None:
-                logger.log(f"episode/normalised score", (sum_reward - game_benchmark_df['Random']) / (
-                            game_benchmark_df['Human'] - game_benchmark_df['Random']), global_step=total_steps)
-                for algorithm in game_benchmark_df.index[2:]:
-                    denominator = game_benchmark_df[algorithm] - game_benchmark_df['Random']
-                    if denominator != 0:
-                        normalized_score = (sum_reward - game_benchmark_df['Random']) / denominator
-                        logger.log(f"benchmark/normalised {algorithm} score", normalized_score, global_step=total_steps)
+            # Use following condition to run games not in Atari100k
+            # if config.BasicSettings.Env_name.startswith('ALE') and game_benchmark_df is not None:
+            logger.log(f"episode/normalised score", (sum_reward - game_benchmark_df['Random']) / (
+                        game_benchmark_df['Human'] - game_benchmark_df['Random']), global_step=total_steps)
+            for algorithm in game_benchmark_df.index[2:]:
+                denominator = game_benchmark_df[algorithm] - game_benchmark_df['Random']
+                if denominator != 0:
+                    normalized_score = (sum_reward - game_benchmark_df['Random']) / denominator
+                    logger.log(f"benchmark/normalised {algorithm} score", normalized_score, global_step=total_steps)
 
             sum_reward = 0
             ob, info = env.reset()

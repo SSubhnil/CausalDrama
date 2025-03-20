@@ -64,68 +64,69 @@ class VQQuantizer(nn.Module):
                 h_flat_norm = h_flat
                 codebook = self.codebook
 
-            # Compute distances
-            if self.use_cdist:
-                distances = torch.cdist(h_flat_norm, codebook, p=2) ** 2
+            # Compute distances - optimized for either mode
+            if self.normalize:
+                # For normalized vectors, cosine similarity is proportional to squared distance
+                similarities = torch.matmul(h_flat_norm, codebook.t())
+                distances = 2 - 2 * similarities
             else:
-                # h_sq = torch.sum(h_flat_norm ** 2, dim=1, keepdim=True)
-                # codebook_sq = torch.sum(codebook ** 2, dim=1).view(1, -1)
-
-                # # Add batch dimension to create 3D tensors
-                # h_flat_norm_3d = h_flat_norm.unsqueeze(0)  # [1, B, D]
-                # codebook_t_3d = codebook.t().unsqueeze(0)  # [1, D, K]
-
-                # # Now use baddbmm with 3D tensors
-                # bmm_result = torch.baddbmm(
-                #     torch.zeros(1, h_flat_norm.size(0), codebook.size(0), device=h_flat_norm.device),
-                #     h_flat_norm_3d,
-                #     codebook_t_3d,
-                #     beta=0.0, alpha=-2.0
-                # )
-
-                # distances = h_sq + codebook_sq + bmm_result.squeeze(0)
-
-                # Original implmentation
-                h_sq = torch.sum(h_flat_norm ** 2, dim=1, keepdim=True)
-                codebook_sq = torch.sum(codebook ** 2, dim=1).view(1, -1)  # Reshape for broadcasting
-                distances = h_sq + codebook_sq - 2 * torch.matmul(h_flat_norm, codebook.t())
+                if self.use_cdist:
+                    distances = torch.cdist(h_flat_norm, codebook, p=2) ** 2
+                else:
+                    h_sq = torch.sum(h_flat_norm ** 2, dim=1, keepdim=True)
+                    codebook_sq = torch.sum(codebook ** 2, dim=1).view(1, -1)
+                    distances = h_sq + codebook_sq - 2 * torch.matmul(h_flat_norm, codebook.t())
             # Compute soft assignments
             # Optimization: For inference, replace with deterministic argmin
-            if not training:
-                indices_flat = torch.argmin(distances, dim=1)
-                q_flat = torch.zeros_like(distances)
-                q_flat.scatter_(1, indices_flat.unsqueeze(1), 1.0)
-            else:
+            # Branch for training vs. inference
+            if training:
+                # Training path - stochastic with Gumbel-softmax
                 q_flat = F.gumbel_softmax(-distances, tau=self.temperature, hard=False, dim=1)
                 indices_flat = torch.argmax(q_flat, dim=1)
-            # Compute soft codes
-            c_tilde_flat = torch.einsum('bk,kd->bd', q_flat, codebook)
 
-            # Hard codebook lookup
-            c_hard_flat = codebook[indices_flat]
+                # Soft codebook lookup
+                c_tilde_flat = torch.einsum('bk,kd->bd', q_flat, codebook)
+                c_hard_flat = codebook[indices_flat]
 
-            # Calculate losses using flat tensors (matching shapes)
-            diff = h_flat_norm - c_tilde_flat
-            codebook_loss = (diff.detach() ** 2).mean()
-            commitment_loss = (diff ** 2).mean()
+                # Loss calculations
+                diff = h_flat_norm - c_tilde_flat
+                codebook_loss = (diff.detach() ** 2).mean()
+                commitment_loss = (diff ** 2).mean()
+                loss = codebook_loss + self.beta * commitment_loss
 
-            # Reshape everything back if input was 3D
+                # Straight-through estimator for training
+                c_quantized = c_tilde_flat + (c_hard_flat - c_tilde_flat.detach())
+            else:
+                # Inference path - deterministic with argmin
+                indices_flat = torch.argmin(distances, dim=1)
+
+                # Create one-hot vectors for compatibility (more efficient than Gumbel-softmax)
+                q_flat = torch.zeros_like(distances)
+                q_flat.scatter_(1, indices_flat.unsqueeze(1), 1.0)
+
+                # Hard codebook lookup only
+                c_hard_flat = codebook[indices_flat]
+                c_tilde_flat = c_hard_flat  # In inference, no need for soft codes
+                c_quantized = c_hard_flat  # No straight-through needed
+
+                # Skip loss computation
+                loss = None
+
+            # Reshape outputs based on input dimensions
             if is_3d:
                 q = q_flat.reshape(original_shape[0], original_shape[1], -1)
                 c_tilde = c_tilde_flat.reshape(original_shape[0], original_shape[1], -1)
                 c_hard = c_hard_flat.reshape(original_shape[0], original_shape[1], -1)
+                c_quantized = c_quantized.reshape(original_shape[0], original_shape[1], -1)
+                indices = indices_flat.reshape(original_shape[0], original_shape[1])
             else:
-                # Unsqueeze to add sequence dimension for 2D inputs
                 q = q_flat
                 c_tilde = c_tilde_flat
                 c_hard = c_hard_flat
+                c_quantized = c_quantized
+                indices = indices_flat
 
-            # Straight-through estimator
-            c_quantized = c_tilde + (c_hard - c_tilde.detach())
-
-            loss = codebook_loss + self.beta * commitment_loss
-
-            return q, c_tilde, c_hard, c_quantized, loss, indices_flat
+            return q, c_tilde, c_hard, c_quantized, loss, indices
 
     def set_temperature(self, new_temp: float):
         """
@@ -179,15 +180,14 @@ class DualVQQuantizer(nn.Module):
             self.lambda_couple = lambda_couple
             self.sparsity_weight = sparsity_weight
 
-    def forward(self, h_tr: torch.Tensor, h_re: torch.Tensor):
+    def forward(self, h_tr: torch.Tensor, h_re: torch.Tensor, training=False):
         """
         Args:
             h_tr (Tensor): Transition projections. shape [B, D]
             h_re (Tensor): Reward projections. shape [B, D]
         """
-        q_tr, soft_tr, hard_tr, quantized_tr, quant_loss_tr, indices_tr = self.tr_quantizer(h_tr)
-        q_re, soft_re, hard_re, quantized_re, quant_loss_re, indices_re = self.re_quantizer(h_re)
-        total_loss = quant_loss_tr + quant_loss_re
+        q_tr, soft_tr, hard_tr, quantized_tr, quant_loss_tr, indices_tr = self.tr_quantizer(h_tr, training)
+        q_re, soft_re, hard_re, quantized_re, quant_loss_re, indices_re = self.re_quantizer(h_re, training)
 
         output_dict = {
             'q_tr': q_tr,  # Soft assignments [B, T, KTr]
@@ -200,28 +200,32 @@ class DualVQQuantizer(nn.Module):
             'hard_re': hard_re,
             'quantized_re': quantized_re,
             'indices_re': indices_re,  # Add this new field
-            'loss': total_loss
         }
 
-        if self.coupling:  # Conditional coupling mechanism
-            logits_tr_from_re = self.coupling_mlp(q_re.detach())  # Stop reward -> transition gradient
-            p_tr_cond_re = F.log_softmax(logits_tr_from_re /
-                                         self.tr_quantizer.temperature, dim=-1)
+        if training:
+            # Only calculate losses during training
+            total_loss = quant_loss_tr + quant_loss_re
+            if self.coupling:  # Conditional coupling mechanism
+                logits_tr_from_re = self.coupling_mlp(q_re.detach())  # Stop reward -> transition gradient
+                p_tr_cond_re = F.log_softmax(logits_tr_from_re /
+                                             self.tr_quantizer.temperature, dim=-1)
 
-            kl_loss = F.kl_div(p_tr_cond_re, q_tr.detach(), reduction='batchmean',
-                               log_target=False)
-            # Questionable reverse KL -> might remove
-            # reverse_kl = F.kl_div(q_tr.log(), p_tr_cond_re.detach().exp(), reduction='batchmean')
+                kl_loss = F.kl_div(p_tr_cond_re, q_tr.detach(), reduction='batchmean',
+                                   log_target=False)
+                # Questionable reverse KL -> might remove
+                # reverse_kl = F.kl_div(q_tr.log(), p_tr_cond_re.detach().exp(), reduction='batchmean')
 
-            # May keep KL asymmetrical?
-            coupling_loss = kl_loss * self.lambda_couple
-            sparsity_loss = self.coupling_mlp.sparsity_mask.abs().mean()
-            total_loss += coupling_loss + self.sparsity_weight * sparsity_loss
+                # May keep KL asymmetrical?
+                coupling_loss = kl_loss * self.lambda_couple
+                sparsity_loss = self.coupling_mlp.sparsity_mask.abs().mean()
+                total_loss += coupling_loss + self.sparsity_weight * sparsity_loss
 
-            output_dict.update({
-                'coupling_loss': coupling_loss,
-                'loss': total_loss
-            })
+                output_dict['coupling_loss'] = coupling_loss
+
+            output_dict['loss'] = total_loss
+        else:
+            # Skip loss calculation for inference
+            output_dict['loss'] = None
 
         return output_dict
 

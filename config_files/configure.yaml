@@ -3,7 +3,7 @@ BasicSettings:
   ImageChannel: 3
   ReplayBufferOnGPU: True
   Seed: 3710
-  Env_name: ALE/MontezumaRevenge-v5
+  Env_name: ALE/Pong-v5
   Device: cuda:0
   Use_amp: True
   Use_cg: True
@@ -19,8 +19,16 @@ Evaluate:
    DuringTraining: False
    EverySteps: 1000
 
+PhasedTraining: # Alternate training of the Causal model and world model
+  Enabled: True
+  StepsPerPhase: 1       # How many steps to stay in each phase
+  AlternationFrequency: 1  # Switch phase every 4 steps (1=every step)
+  PhaseMultiplier: 2       # Train the active component twice
+  SeparateOptimizers: True
+  CausalModelLR: 5e-5      # Separate learning rate for causal model
+
 JointTrainAgent:
-  SampleMaxSteps: 200000 # Just to make sure the last episode will finish, no training after 100k
+  SampleMaxSteps: 100000 # Just to make sure the last episode will finish, no training after 100k
   BufferMaxLength: 100000
   WorldModelWarmUp: 1032
   BehaviourWarmUp: 1032
@@ -181,7 +189,7 @@ Models:
 
   Agent:
     dtype: float32
-    Policy: AC # AC or PPO
+    Policy: PPO # AC or PPO
     Unimix_ratio: 0
     AC:
       NumLayers: 3
