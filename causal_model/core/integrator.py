@@ -1,5 +1,7 @@
+import torch
 import torch.nn as nn
 import time
+from line_profiler import profile
 from .encoder import CausalEncoder
 from .quantizer import DualVQQuantizer
 from .confounder_approx import ConfounderPosterior, ConfounderPrior
@@ -105,7 +107,8 @@ class CausalModel(nn.Module):
             'tr_sparsity_weight': self.predictor_params.Transition.MaskSparsityWeight
         })
         self.state_modulator = StateModulator(self.hidden_state_dim, self.predictor_params.Transition.HiddenDim,
-                                              self.code_dim_tr, self.confounder_params.ConfDim)
+                                              self.code_dim_tr, self.confounder_params.ConfDim,
+                                              self.predictor_params.ComputeInvarianceLoss)
 
         self.tr_head = MoETransitionHead(hidden_state_dim=self.hidden_state_dim,
                                          hidden_dim=self.predictor_params.Transition.HiddenDim,
@@ -132,128 +135,70 @@ class CausalModel(nn.Module):
                                                dtype=params.Models.WorldModel.dtype,
                                                device=self.device)
 
-    # def forward(self, h, detach_encoder=False):
+    @profile
+    def forward(self, h, global_step, training=False):
 
-    # if detach_encoder:
-    #     h_stable = h.detach()
-    # else:
-    #     h_stable = h
-
-    # # Projection of raw hidden state into h_tr and h_re
-    # h_proj_tr, h_proj_re = self.causal_encoder(h_stable)
-
-    # # Projections go into Dual Codebook Quantizer
-    # quant_output_dict = self.quantizer(h_proj_tr, h_proj_re)
-
-    # code_emb_tr = quant_output_dict['quantized_tr']
-
-    # # Quantization Loss Total - loss weights in-code
-    # quant_loss = quant_output_dict['loss']
-
-    # # Confounder approximation with transition codebook
-    # # Prior uses EMA codebook entries ('code_emb_momentum') that require discrete indices for lookup.
-    # # hard_tr codes ensure prior stability during posterior training (no grad flow to codebook)
-    # mu_prior, logvar_prior = self.confounder_prior_net(h_proj_tr.detach(),
-    #                                                    code_ids=quant_output_dict['hard_tr'].argmax(-1)) # Discrete indices [B, T]
-    # prior_code_alignment_loss = self.confounder_prior_net.code_alignment_loss() * self.loss_weights['prior_code_align']
-    # prior_reg_loss = self.confounder_prior_net.prior_regularization(mu_prior) * self.loss_weights['prior_reg_weight']
-
-    # # Confounder posterior
-    # u_post, kl_loss = self.confounder_post_net(h_proj_tr, code_emb_tr,
-    #                                            mu_prior.detach(), logvar_prior.detach())
-    # post_l2_reg, post_sparsity = self.confounder_post_net.regularization_loss()
-
-    # # Applying the weights to each component individually
-    # post_l2_reg = post_l2_reg * self.loss_weights['post_reg']
-    # post_sparsity = post_sparsity * self.loss_weights['post_sparsity']
-    # kl_loss = kl_loss * self.loss_weights['kl_loss_weight']
-
-    # confounder_loss = prior_code_alignment_loss + prior_reg_loss + post_l2_reg +\
-    #     post_sparsity + kl_loss
-
-    # causal_loss = quant_loss + confounder_loss
-
-    # return quant_output_dict, u_post, causal_loss
-# gradient flow report
-    def forward(self, h, global_step):
-        should_profile = hasattr(self, 'profile_counter') and self.profile_counter % 1 == 0
-
-        if not hasattr(self, 'profile_counter'):
-            self.profile_counter = 0
-        else:
-            self.profile_counter += 1
-
-        if should_profile:
-            print(f"\n==== Profiling CausalModel.forward() ====")
-            start_time = time.time()
-
-            # Monitor input gradient connectivity
-            input_requires_grad = h.requires_grad
-            print(f"Input requires_grad: {input_requires_grad}")
-
-        # Original code with detachment control (critical for gradient flow)
+        # Common operations needed for both paths
         if global_step < 1033:
             h_stable = h.detach()
-            if should_profile:
-                print("INPUT DETACHED - No gradients will flow back to sequence model")
         else:
             h_stable = h
-            if should_profile:
-                print("INPUT NOT DETACHED - Gradients will flow back to sequence model")
 
         # Projection of raw hidden state into h_tr and h_re
-        if should_profile:
-            encoder_start = time.time()
         h_proj_tr, h_proj_re = self.causal_encoder(h_stable)
-        if should_profile:
-            print(f"Causal Encoder: {time.time() - encoder_start:.4f}s")
-            quantizer_start = time.time()
 
-        # Projections go into Dual Codebook Quantizer
-        quant_output_dict = self.quantizer(h_proj_tr, h_proj_re)
+        # Different paths for training and inference
+        if training:
+            # Full training path with all losses
+            quant_output_dict = self.quantizer(h_proj_tr, h_proj_re, training=True)
+            code_emb_tr = quant_output_dict['quantized_tr']
+            quant_loss = quant_output_dict['loss']
 
-        code_emb_tr = quant_output_dict['quantized_tr']
+            # Confounder prior network calculations with all losses
+            mu_prior, logvar_prior = self.confounder_prior_net(h_proj_tr.detach(),
+                                                               code_ids=quant_output_dict['hard_tr'].argmax(-1))
+            prior_code_alignment_loss = self.confounder_prior_net.code_alignment_loss() * self.loss_weights[
+                'prior_code_align']
+            prior_reg_loss = self.confounder_prior_net.prior_regularization(mu_prior) * self.loss_weights[
+                'prior_reg_weight']
 
-        # Quantization Loss Total - loss weights in-code
-        quant_loss = quant_output_dict['loss']
-        if should_profile:
-            print(f"Quantizer: {time.time() - quantizer_start:.4f}s")
-            confounder_start = time.time()
+            # Confounder posterior with KL loss
+            u_post, kl_loss = self.confounder_post_net(h_proj_tr, code_emb_tr,
+                                                       mu_prior.detach(), logvar_prior.detach())
 
-        # Confounder approximation with transition codebook
-        # Prior uses EMA codebook entries ('code_emb_momentum') that require discrete indices for lookup.
-        # hard_tr codes ensure prior stability during posterior training (no grad flow to codebook)
-        mu_prior, logvar_prior = self.confounder_prior_net(h_proj_tr.detach(),
-                                                           code_ids=quant_output_dict['hard_tr'].argmax(
-                                                               -1))  # Discrete indices [B, T]
-        prior_code_alignment_loss = self.confounder_prior_net.code_alignment_loss() * self.loss_weights[
-            'prior_code_align']
-        prior_reg_loss = self.confounder_prior_net.prior_regularization(mu_prior) * self.loss_weights[
-            'prior_reg_weight']
+            # Regularization losses
+            post_l2_reg, post_sparsity = self.confounder_post_net.regularization_loss()
+            post_l2_reg = post_l2_reg * self.loss_weights['post_reg']
+            post_sparsity = post_sparsity * self.loss_weights['post_sparsity']
+            kl_loss = kl_loss * self.loss_weights['kl_loss_weight']
 
-        # Confounder posterior
-        u_post, kl_loss = self.confounder_post_net(h_proj_tr, code_emb_tr,
-                                                   mu_prior.detach(), logvar_prior.detach())
-        post_l2_reg, post_sparsity = self.confounder_post_net.regularization_loss()
+            # Combine all losses
+            confounder_loss = prior_code_alignment_loss + prior_reg_loss + post_l2_reg + \
+                              post_sparsity + kl_loss
+            causal_loss = quant_loss + confounder_loss
 
-        # Applying the weights to each component individually
-        post_l2_reg = post_l2_reg * self.loss_weights['post_reg']
-        post_sparsity = post_sparsity * self.loss_weights['post_sparsity']
-        kl_loss = kl_loss * self.loss_weights['kl_loss_weight']
+            return quant_output_dict, u_post, causal_loss
+        else:  # Inference
+            # Optimized inference path - skip unnecessary computations
+            quant_output_dict = self.quantizer(h_proj_tr, h_proj_re, training=False)
+            code_emb_tr = quant_output_dict['quantized_tr']
 
-        confounder_loss = prior_code_alignment_loss + prior_reg_loss + post_l2_reg + \
-                          post_sparsity + kl_loss
+            # Only calculate what's needed for inference
+            mu_prior, logvar_prior = self.confounder_prior_net(h_proj_tr.detach(),
+                                                               code_ids=quant_output_dict['hard_tr'].argmax(-1))
 
-        causal_loss = quant_loss + confounder_loss
+            # Skip KL and regularization loss calculations
+            u_post = self._inference_posterior(h_proj_tr, code_emb_tr, mu_prior, logvar_prior)
 
-        if should_profile:
-            print(f"Confounder Networks: {time.time() - confounder_start:.4f}s")
-            print(f"Total Causal Model Forward: {time.time() - start_time:.4f}s")
+            return quant_output_dict, u_post, None
 
-            # Print detachment points to help identify gradient flow
-            print("\n--- Gradient Flow Analysis ---")
-            print(f"Prior input detached: True (h_proj_tr.detach())")
-            print(f"Prior output detached in posterior: True (mu_prior.detach())")
-            print(f"Code embedding detached in StateModulator: Verify in state_modulator.forward()")
+    def _inference_posterior(self, h, code_emb, mu_prior, logvar_prior):
+        """Fast inference-only posterior calculation"""
+        with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=True):
+            # Generate posterior parameters
+            mu_post = torch.clamp(self.confounder_post_net.confounder_post_mu_net(h, code_emb), min=-10.0, max=10.0)
+            logvar_post = self.confounder_post_net.confounder_post_logvar_net(h, code_emb)
 
-        return quant_output_dict, u_post, causal_loss
+            # Reparameterize
+            return self.confounder_post_net.reparameterize(mu_post, logvar_post)
+

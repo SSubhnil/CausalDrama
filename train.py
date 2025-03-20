@@ -1,6 +1,6 @@
 import os
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 import gymnasium
 import argparse
 import numpy as np
@@ -18,6 +18,9 @@ import agents
 from sub_models.world_models import WorldModel
 from mamba_ssm import InferenceParams
 from line_profiler import profile
+# To view the profiling during execution - add @profile on top of functions
+# kernprof -l -v train.py
+
 import yaml
 from envs.my_memory_maze import MemoryMaze
 from envs.my_atari import Atari
@@ -204,7 +207,7 @@ def joint_train_world_model_agent(config, logdir,
         if is_last:
             logger.log(f"episode/score", sum_reward, global_step=total_steps)
             logger.log(f"episode/length", info["episode_frame_number"], global_step=total_steps)  # framskip=4
-            if config.BasicSettings.Env_name.startswith('ALE'):
+            if config.BasicSettings.Env_name.startswith('ALE') and game_benchmark_df is not None:
                 logger.log(f"episode/normalised score", (sum_reward - game_benchmark_df['Random']) / (
                             game_benchmark_df['Human'] - game_benchmark_df['Random']), global_step=total_steps)
                 for algorithm in game_benchmark_df.index[2:]:
@@ -230,10 +233,9 @@ def joint_train_world_model_agent(config, logdir,
                 global_step=total_steps
             )
             # Monitor memory growth
-            if total_steps % (
-                    config.JointTrainAgent.TrainDynamicsEverySteps * 10 // config.JointTrainAgent.NumEnvs) == 0:
-                current_mem = monitor_memory_growth()
-                print(f"Current memory usage: {current_mem:.2f} GB")
+            # if total_steps % (config.JointTrainAgent.TrainDynamicsEverySteps * 10 // config.JointTrainAgent.NumEnvs) == 0:
+            #     current_mem = monitor_memory_growth()
+            #     print(f"Current memory usage: {current_mem:.2f} GB")
 
         if replay_buffer.ready('behaviour') and total_steps % (
                 config.JointTrainAgent.TrainAgentEverySteps // config.JointTrainAgent.NumEnvs) == 0 and total_steps <= config.JointTrainAgent.FreezeBehaviourAfterSteps:
@@ -390,6 +392,10 @@ def update_model_parameters(config, world_model, agent):
     config.update_or_create('Models.WorldModel.DecoderParamNum',
                             sum([p.numel() for p in world_model.image_decoder.parameters()]))
     print(f'Decoder parameters: {sum([p.numel() for p in world_model.image_decoder.parameters()]):,}')
+
+    config.update_or_create('Models.WorldModel.CausalModelParamNum',
+                            sum([p.numel() for p in world_model.causal_model.parameters()]))
+    print(f'Causal Model parameters: {sum([p.numel() for p in world_model.causal_model.parameters()]):,}')
 
     config.update_or_create('Models.WorldModel.DiscretisationLayerParamNum',
                             sum([p.numel() for p in world_model.dist_head.parameters()]))

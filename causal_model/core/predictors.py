@@ -8,9 +8,9 @@ import torch.nn.functional as F
 class StateModulator(nn.Module):
     """Dedicated module for hidden state modulation based on causal factors."""
 
-    def __init__(self, hidden_state_dim, hidden_dim, code_dim, conf_dim):
+    def __init__(self, hidden_state_dim, hidden_dim, code_dim, conf_dim, compute_invariance_loss=False):
         super().__init__()
-
+        self.compute_invariance_loss = compute_invariance_loss
         # Projection layer for H modulation
         self.proj_w = nn.Sequential(
             nn.Linear(hidden_state_dim, hidden_state_dim),
@@ -44,7 +44,7 @@ class StateModulator(nn.Module):
         self.sigma_decay = 0.9995
         self.register_buffer('step', torch.tensor(0))
 
-    def forward(self, h, code_emb, u, global_step, compute_invariance_loss=False):
+    def forward(self, h, code_emb, u, global_step):
         if h.shape[1] != code_emb.shape[1]:
             if h.shape[1] < code_emb.shape[1]:
                 # Extract the last sequence element from code_emb and u
@@ -82,7 +82,7 @@ class StateModulator(nn.Module):
 
         # Compute invariance loss if requested (during training)
         inv_loss = 0.0
-        if compute_invariance_loss and self.training:
+        if self.compute_invariance_loss:
             noise = torch.randn_like(h) * self.sigma
             h_transformed_noisy = self.proj_w(h + noise)
             h_modulated_noisy = scale * h_transformed_noisy + shift

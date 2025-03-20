@@ -472,9 +472,9 @@ class WorldModel(nn.Module):
 
             last_dist_feat = dist_feat[:, -1:]
             # Add causal model processing
-            quant_output_dict, u_post, _ = self.causal_model(last_dist_feat)
+            quant_output_dict, u_post, _ = self.causal_model(last_dist_feat, 1000)
             modulated_feat, _ = self.causal_model.state_modulator(last_dist_feat, quant_output_dict['quantized_tr'],
-                                                                  u_post)
+                                                                  u_post, 1000)
             code_emb_tr = quant_output_dict['quantized_tr'][:, -1:]  # Get transition codes
 
             prior_logits, _, _, _ = self.dist_head.forward_prior(modulated_feat, code_emb_tr, u_post)
@@ -745,184 +745,42 @@ class WorldModel(nn.Module):
                          dim=-1), self.action_buffer, old_logits_tensor, torch.cat(
             [context_flattened_sample, context_dist_feat], dim=-1), self.reward_hat_buffer, self.termination_hat_buffer
 
-    # @profile
-    # def update(self, obs, action, reward, termination, global_step, epoch_step, logger=None):
-    # self.train()
-    # batch_size, batch_length = obs.shape[:2]
-    # with (torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp)):
-    #     # encoding
-    #     embedding = self.encoder(obs)
-    #     post_logits = self.dist_head.forward_post(embedding)
-    #     sample = self.stright_throught_gradient(post_logits, sample_mode="random_sample")
-    #     flattened_sample = self.flatten_sample(sample)
-
-    #     # decoding image
-    #     obs_hat = self.image_decoder(flattened_sample)
-
-    #     # dynamics core
-    #     if self.model == 'Transformer':
-    #         temporal_mask = get_subsequent_mask_with_batch_length(batch_length, flattened_sample.device)
-    #         dist_feat = self.sequence_model(flattened_sample, action, temporal_mask)
-    #     else:
-    #         dist_feat = self.sequence_model(flattened_sample, action)
-
-    #     """Replace these parts with the causal model"""
-    #     # 1. Pass the dist_feat to the causal model encoder -> quantizer -> confounding
-    #     quantizer_output, u_post, causal_loss = self.causal_model(dist_feat)
-    #     mod_dist_feat, inv_loss = self.causal_model.state_modulator(dist_feat, quantizer_output['quantized_tr'],
-    #                                                                 u_post)
-
-    #     prior_logits, total_tr_loss, aux_loss, sparsity_loss = \
-    #         self.dist_head.forward_prior(mod_dist_feat, quantizer_output['quantized_tr'], u_post)
-
-    #     # decoding reward and termination with dist_feat
-    #     reward_hat, re_head_loss = self.reward_decoder(mod_dist_feat, quantizer_output['quantized_re'],
-    #                                                    quantizer_output['q_re'])
-    #     reward_decoded = self.symlog_twohot_loss_func.decode(reward_hat)  # Convert to scalar values
-    #     termination_hat = self.termination_decoder(mod_dist_feat)
-
-    #     """Model losses from causal model"""
-    #     # env loss
-    #     pred_loss = 0.1 * inv_loss + 0.01 * aux_loss + 0.05 * sparsity_loss
-    #     reconstruction_loss = self.mse_loss_func(obs_hat[:batch_size], obs[:batch_size])
-    #     reward_loss = F.mse_loss(reward_decoded, symlog(reward))
-    #     termination_loss = self.bce_with_logits_loss_func(termination_hat, termination)
-    #     # dyn-rep loss
-    #     # pred_loss = (self.loss_weights['tr_aux_loss'] * aux_loss) + (
-    #     #             self.loss_weights['tr_sparsity_weight'] * sparsity_loss)
-    #     dynamics_loss, dynamics_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:].detach(),
-    #                                                                        prior_logits[:, :-1])
-    #     representation_loss, representation_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:],
-    #                                                                                    prior_logits[:,
-    #                                                                                    :-1].detach())
-    #     total_loss = reconstruction_loss + reward_loss + termination_loss + dynamics_loss + 0.1 * representation_loss + causal_loss + pred_loss + re_head_loss
-
-    # # gradient descent
-    # self.scaler.scale(total_loss).backward()
-    # self.scaler.unscale_(self.optimizer)  # for clip grad
-    # torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=self.max_grad_norm)
-    # self.scaler.step(self.optimizer)
-    # self.scaler.update()
-    # self.optimizer.zero_grad(set_to_none=True)
-    # self.lr_scheduler.step()
-    # self.warmup_scheduler.dampen()
-
-    # if (global_step + epoch_step) % self.save_every_steps == 0:  # and global_step != 0:
-    #     sample_obs = torch.clamp(obs[:3, 0, :] * 255, 0, 255).permute(0, 2, 3,
-    #                                                                   1).cpu().detach().float().numpy().astype(
-    #         np.uint8)
-    #     sample_obs_hat = torch.clamp(obs_hat[:3, 0, :] * 255, 0, 255).permute(0, 2, 3,
-    #                                                                           1).cpu().detach().float().numpy().astype(
-    #         np.uint8)
-
-    #     concatenated_images = []
-    #     for idx in range(3):
-    #         concatenated_image = np.concatenate((sample_obs[idx], sample_obs_hat[idx]),
-    #                                             axis=0)  # Concatenate vertically
-    #         concatenated_images.append(concatenated_image)
-
-    #     # Combine selected images into one image
-    #     final_image = np.concatenate(concatenated_images, axis=1)  # Concatenate horizontally
-    #     height, width, _ = final_image.shape
-    #     scale_factor = 6
-    #     final_image_resized = cv2.resize(final_image, (width * scale_factor, height * scale_factor),
-    #                                      interpolation=cv2.INTER_NEAREST)
-    #     logger.log("Reconstruct/Reconstructed images", [final_image_resized], global_step=global_step)
-
-    # return reconstruction_loss.item(), reward_loss.item(), termination_loss.item(), \
-    #     dynamics_loss.item(), dynamics_real_kl_div.item(), representation_loss.item(), \
-    #     representation_real_kl_div.item(), total_loss.item()
-
-    # Profiler enabled update(). See above for original
     @profile
     def update(self, obs, action, reward, termination, global_step, epoch_step, logger=None):
         self.train()
         batch_size, batch_length = obs.shape[:2]
-
-        # Determine if we should profile this step
-        should_profile = (global_step + epoch_step) % 1 == 0
-        # should_profile = True
-
-        if should_profile:
-            print(f"\n==== Profiling update() at step {global_step} ====")
-            profile_memory()
-            start_time = time.time()
-
         with (torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp)):
             # encoding
-            # Encoding
-            if should_profile:
-                encoding_start = time.time()
-
             embedding = self.encoder(obs)
             post_logits = self.dist_head.forward_post(embedding)
             sample = self.stright_throught_gradient(post_logits, sample_mode="random_sample")
             flattened_sample = self.flatten_sample(sample)
 
-            if should_profile:
-                print(f"Encoding: {time.time() - encoding_start:.4f}s")
-
             # decoding image
-            if should_profile:
-                image_decoder_start = time.time()
-
             obs_hat = self.image_decoder(flattened_sample)
 
-            if should_profile:
-                print(f"Image Decoder: {time.time() - image_decoder_start:.4f}s")
-
             # dynamics core
-            if should_profile:
-                dynamics_start = time.time()
             if self.model == 'Transformer':
                 temporal_mask = get_subsequent_mask_with_batch_length(batch_length, flattened_sample.device)
                 dist_feat = self.sequence_model(flattened_sample, action, temporal_mask)
             else:
                 dist_feat = self.sequence_model(flattened_sample, action)
 
-            if should_profile:
-                print(f"Dynamics: {time.time() - dynamics_start:.4f}s")
-
-            """Replace these parts with the causal model"""
             # 1. Pass the dist_feat to the causal model encoder -> quantizer -> confounding
-            # Causal Model
-            if should_profile:
-                causal_start = time.time()
-            quantizer_output, u_post, causal_loss = self.causal_model(dist_feat, global_step)
-            if should_profile:
-                print(f"Causal Model: {time.time() - causal_start:.4f}s")
-
-            # State modulation
-            if should_profile:
-                modulation_start = time.time()
+            quantizer_output, u_post, causal_loss = self.causal_model(dist_feat, global_step, training=True)
             mod_dist_feat, inv_loss = self.causal_model.state_modulator(dist_feat, quantizer_output['quantized_tr'],
                                                                         u_post, global_step)
-            if should_profile:
-                print(f"State Modulation: {time.time() - modulation_start:.4f}s")
 
-            # Dynamics Head
-            if should_profile:
-                transition_start = time.time()
             prior_logits, total_tr_loss, aux_loss, sparsity_loss = \
                 self.dist_head.forward_prior(mod_dist_feat, quantizer_output['quantized_tr'], u_post)
-            if should_profile:
-                print(f"Transition Head: {time.time() - transition_start:.4f}s")
 
-            # Reward and transition heads
             # decoding reward and termination with dist_feat
-            if should_profile:
-                reward_term_start = time.time()
             reward_hat, re_head_loss = self.reward_decoder(mod_dist_feat, quantizer_output['quantized_re'],
-                                                           quantizer_output['q_re'])
+                                                        quantizer_output['q_re'])
             reward_decoded = self.symlog_twohot_loss_func.decode(reward_hat)  # Convert to scalar values
             termination_hat = self.termination_decoder(mod_dist_feat)
-            if should_profile:
-                print(f"Reward/Term Decoders: {time.time() - reward_term_start:.4f}s")
 
             """Model losses from causal model"""
-            # Compute losses
-            if should_profile:
-                losses_start = time.time()
             # env loss
             pred_loss = 0.1 * inv_loss + 0.01 * aux_loss + 0.05 * sparsity_loss
             reconstruction_loss = self.mse_loss_func(obs_hat[:batch_size], obs[:batch_size])
@@ -932,58 +790,28 @@ class WorldModel(nn.Module):
             # pred_loss = (self.loss_weights['tr_aux_loss'] * aux_loss) + (
             #             self.loss_weights['tr_sparsity_weight'] * sparsity_loss)
             dynamics_loss, dynamics_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:].detach(),
-                                                                               prior_logits[:, :-1])
+                                                                            prior_logits[:, :-1])
             representation_loss, representation_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:],
-                                                                                           prior_logits[:,
-                                                                                           :-1].detach())
+                                                                                        prior_logits[:,
+                                                                                        :-1].detach())
             total_loss = reconstruction_loss + reward_loss + termination_loss + dynamics_loss + 0.1 * representation_loss + causal_loss + pred_loss + re_head_loss
-            if should_profile:
-                print(f"Loss Computation: {time.time() - losses_start:.4f}s")
 
         # gradient descent
-        if should_profile:
-            backward_start = time.time()
-            mem_before_backward = torch.cuda.memory_allocated() / (1024 ** 2) if torch.cuda.is_available() else 0
         self.scaler.scale(total_loss).backward()
-        if should_profile:
-            mem_after_backward = torch.cuda.memory_allocated() / (1024 ** 2) if torch.cuda.is_available() else 0
-            print(
-                f"Backward: {time.time() - backward_start:.4f}s (Memory: {mem_before_backward:.1f}MB → {mem_after_backward:.1f}MB, Δ: {mem_after_backward - mem_before_backward:.1f}MB)")
-
         self.scaler.unscale_(self.optimizer)  # for clip grad
-        track_grad_flow(self.named_parameters())
-        # Optimizer step
-        if should_profile:
-            optimizer_start = time.time()
-
         torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=self.max_grad_norm)
         self.scaler.step(self.optimizer)
-        track_grad_flow(self.named_parameters())
         self.scaler.update()
         self.optimizer.zero_grad(set_to_none=True)
-
-        if should_profile:
-            print(f"Optimizer Step: {time.time() - optimizer_start:.4f}s")
-            print(f"Total Update: {time.time() - start_time:.4f}s")
-            profile_memory()
-
-            # Check for memory leakage pattern
-            if hasattr(self, 'last_mem_usage'):
-                mem_increase = mem_after_backward - self.last_mem_usage
-                if mem_increase > 10:  # 10MB threshold for warning
-                    print(
-                        f"WARNING: Memory increased by {mem_increase:.1f}MB since last step - possible gradient leakage!")
-            self.last_mem_usage = mem_after_backward
-
         self.lr_scheduler.step()
         self.warmup_scheduler.dampen()
 
         if (global_step + epoch_step) % self.save_every_steps == 0:  # and global_step != 0:
             sample_obs = torch.clamp(obs[:3, 0, :] * 255, 0, 255).permute(0, 2, 3,
-                                                                          1).cpu().detach().float().numpy().astype(
+                                                                        1).cpu().detach().float().numpy().astype(
                 np.uint8)
             sample_obs_hat = torch.clamp(obs_hat[:3, 0, :] * 255, 0, 255).permute(0, 2, 3,
-                                                                                  1).cpu().detach().float().numpy().astype(
+                                                                                1).cpu().detach().float().numpy().astype(
                 np.uint8)
 
             concatenated_images = []
@@ -997,11 +825,9 @@ class WorldModel(nn.Module):
             height, width, _ = final_image.shape
             scale_factor = 6
             final_image_resized = cv2.resize(final_image, (width * scale_factor, height * scale_factor),
-                                             interpolation=cv2.INTER_NEAREST)
+                                            interpolation=cv2.INTER_NEAREST)
             logger.log("Reconstruct/Reconstructed images", [final_image_resized], global_step=global_step)
 
-        if global_step % 10 == 0:
-            torch.cuda.empty_cache()
         return reconstruction_loss.item(), reward_loss.item(), termination_loss.item(), \
             dynamics_loss.item(), dynamics_real_kl_div.item(), representation_loss.item(), \
             representation_real_kl_div.item(), total_loss.item()

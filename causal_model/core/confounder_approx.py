@@ -2,7 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-torch.set_float32_matmul_precision('high')  # Enable TF32 on Ampere
+from line_profiler import profile
+
+from torch.cuda.amp import autocast
 
 """
 Posterior computation only.
@@ -57,23 +59,34 @@ class PosteriorHypernet(nn.Module):
             x_expanded = x.unsqueeze(1).expand(-1, T, -1).reshape(B * T, -1)  # [B*T, D]
 
             # Process each batch element separately
-            h = torch.zeros(B * T, self.hidden_dim, device=x.device)
-            for i in range(B * T):
-                weight = w1[i, 0]  # [hidden_dim]
-                bias = w1[i, 1]  # [hidden_dim]
+            # h = torch.zeros(B * T, self.hidden_dim, device=x.device)
+            # for i in range(B * T):
+            #     weight = w1[i, 0]  # [hidden_dim]
+            #     bias = w1[i, 1]  # [hidden_dim]
 
-                # Apply the weight as a simple scaled sum of inputs
-                h[i] = weight * x_expanded[i].sum() + bias
+            #     # Apply the weight as a simple scaled sum of inputs
+            #     h[i] = weight * x_expanded[i].sum() + bias
 
-            h = F.silu(h)
+            weight_1 = w1[:, 0]  # [B*T, hidden_dim]
+            bias_1 = w1[:, 1]  # [B*T, hidden_dim]
+
+            # Sum across input featues (more efficient)
+            x_sum = x_expanded.sum(dim=1, keepdim=True)  # [B*T, 1]
+
+            h = F.silu(weight_1 * x_sum + bias_1)
 
             # Similarly for the second layer
-            output = torch.zeros(B * T, self.out_dim, device=x.device)
-            for i in range(B * T):
-                weight = w2[i, 0]  # [out_dim]
-                bias = w2[i, 1]  # [out_dim]
+            # output = torch.zeros(B * T, self.out_dim, device=x.device)
+            # for i in range(B * T):
+            #     weight = w2[i, 0]  # [out_dim]
+            #     bias = w2[i, 1]  # [out_dim]
 
-                output[i] = weight * h[i].sum() + bias
+            #     output[i] = weight * h[i].sum() + bias
+
+            weight_2 = w2[:, 0]  # [B*T, out_dim]
+            bias_2 = w2[:, 1]  # [B*T, out_dim]
+            h_sum = h.sum(dim=1, keepdim=True)  # [B*T, 1]
+            output = weight_2 * h_sum + bias_2
 
             # Reshape to expected output dimensions
             output = output.reshape(B, T, self.out_dim)
@@ -122,8 +135,8 @@ class ConfounderPosterior(nn.Module):
         # Code embedding layer
         self.h_proj = nn.Linear(self.code_dim, self.hidden_dim)
         self.code_proj = nn.Linear(self.embed_dim, self.hidden_dim)
-        self.code_embed = nn.Embedding(self.num_codes, self.code_dim) # nn.Embedding(self.num_codes, self.embed_dim)
-        nn.init.orthogonal_(self.code_embed.weight) # Preserve code distances
+        self.code_embed = nn.Embedding(self.num_codes, self.code_dim)  # nn.Embedding(self.num_codes, self.embed_dim)
+        nn.init.orthogonal_(self.code_embed.weight)  # Preserve code distances
 
         # Posterior networks
         self.confounder_post_mu_net = PosteriorHypernet(self.code_dim, self.hidden_dim, self.conf_dim)
@@ -158,6 +171,7 @@ class ConfounderPosterior(nn.Module):
 
         return True
 
+    @profile
     def forward(self, h: torch.Tensor, code_emb, mu_prior, logvar_prior):
         """
         Args:
@@ -170,7 +184,7 @@ class ConfounderPosterior(nn.Module):
         self.check_dimensions(h, (h.size(0), h.size(1), self.code_dim), "h input")
         self.check_dimensions(code_emb, (code_emb.size(0), code_emb.size(1), self.code_dim), "code_emb")
 
-        with torch.autocast(device_type='cuda', dtype=torch.float16):
+        with (torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=True)):
             # Generate posterior parameters
             # mu_post = self.confounder_post_mu_net(h, code_emb)
             mu_post = torch.clamp(self.confounder_post_mu_net(h, code_emb), min=-10.0, max=10.0)
@@ -181,7 +195,7 @@ class ConfounderPosterior(nn.Module):
 
             # Reparameterization trick
             u_post = self.reparameterize(mu_post, logvar_post)
-            kl_loss = self.gaussian_KL(mu_post, logvar_post, mu_prior, logvar_prior)
+            kl_loss = self.gaussian_KL(mu_post, logvar_post, mu_prior.detach(), logvar_prior.detach())
 
             return u_post, kl_loss
 
@@ -195,37 +209,45 @@ class ConfounderPosterior(nn.Module):
     # Main regularizer
     def regularization_loss(self):
         # Hypernetwork parameter regularization
-        hyper_params = list(self.confounder_post_mu_net.parameters()) + \
-                       list(self.confounder_post_logvar_net.parameters())
+        with (torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=True)):
+            hyper_params = list(self.confounder_post_mu_net.parameters()) + \
+                           list(self.confounder_post_logvar_net.parameters())
 
-        l2_reg = torch.sum(torch.stack([torch.norm(p) for p in hyper_params]))
+            l2_reg = torch.sum(torch.stack([torch.norm(p) for p in hyper_params]))
 
-        # Code embedding sparsity
-        code_sparsity = torch.mean(torch.abs(self.code_embed.weight))
+            # Code embedding sparsity
+            code_sparsity = torch.mean(torch.abs(self.code_embed.weight))
 
-        return l2_reg, code_sparsity
+            return l2_reg, code_sparsity
 
     def gaussian_KL(self, mu_post, logvar_post, mu_prior, logvar_prior):
-        # Add numerical stability
-        var_post = torch.exp(logvar_post).clamp(min=1e-5)
-        var_prior = torch.exp(logvar_prior).clamp(min=1e-5)
+        with (torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=True)):
+            # More stable KL computation
+            var_post = torch.exp(logvar_post).clamp(min=1e-5)
+            var_prior = torch.exp(logvar_prior).clamp(min=1e-5)
 
-        kl_div = 0.5 * (
-                logvar_prior - logvar_post +
-                (var_post + (mu_post - mu_prior) ** 2) / var_prior - 1
-        )
-        return kl_div.sum(1).mean()
+            # Logarithm form is more stable
+            kl_div = 0.5 * (
+                    logvar_prior - logvar_post +
+                    var_post / var_prior +
+                    ((mu_post - mu_prior) ** 2) / var_prior - 1
+            )
+
+            # Clip extreme values
+            kl_div = torch.clamp(kl_div, min=-100, max=100)
+            return kl_div.sum(1).mean()
 
     def reparameterize(self, mu, logvar):
-        std = torch.exp(0.5*logvar).clamp_min(self._eps)
+        std = torch.exp(0.5 * logvar).clamp_min(self._eps)
         return mu + std * torch.randn_like(std)
+
 
 # Initialized for confounder prior
 class ConfounderPrior(nn.Module):
     def __init__(self, num_codes, code_dim, conf_dim, hidden_state_proj_dim, momentum=0.95):
         super().__init__()
 
-        self.code_embed = nn.Embedding(num_codes, code_dim) # Shared embeddings
+        self.code_embed = nn.Embedding(num_codes, code_dim)  # Shared embeddings
         self.register_buffer('code_emb_momentum', torch.empty_like(self.code_embed.weight))
         nn.init.orthogonal_(self.code_emb_momentum)  # Independent initialization
         self.momentum = momentum
@@ -235,7 +257,7 @@ class ConfounderPrior(nn.Module):
         self.mu_net = nn.Sequential(nn.Linear(self.h_proj_dim + code_dim, conf_dim),
                                     nn.LayerNorm(conf_dim),
                                     nn.Linear(conf_dim, conf_dim),
-                                    nn.Tanh() # Constrained output
+                                    nn.Tanh()  # Constrained output
                                     )
         nn.init.kaiming_normal_(self.mu_net[0].weight, nonlinearity='linear')  # First linear layer
         # Initialize final layer for natural parameter bounds
@@ -249,37 +271,36 @@ class ConfounderPrior(nn.Module):
             nn.Hardtanh(min_val=math.log(0.1), max_val=math.log(2.0))
         )
 
-
     def forward(self, h: torch.Tensor, code_ids: torch.Tensor = None):
         # Update momentum codebook
         with torch.no_grad():
             self.code_emb_momentum = (self.momentum * self.code_emb_momentum +
                                       (1 - self.momentum) * self.code_embed.weight.detach())
+        with (torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=True)):
+            # Handle 3D input (batch, sequence, features)
+            if h.dim() == 3 and code_ids is not None:
+                batch_size, seq_len = h.shape[0], h.shape[1]
 
-        # Handle 3D input (batch, sequence, features)
-        if h.dim() == 3 and code_ids is not None:
-            batch_size, seq_len = h.shape[0], h.shape[1]
+                # Reshape code_ids to match sequence length
+                if code_ids.dim() == 2 and code_ids.shape[1] != seq_len:
+                    # Take only the first seq_len indices
+                    code_ids = code_ids[:, :seq_len]
 
-            # Reshape code_ids to match sequence length
-            if code_ids.dim() == 2 and code_ids.shape[1] != seq_len:
-                # Take only the first seq_len indices
-                code_ids = code_ids[:, :seq_len]
+            # Ensure indices are in bounds
+            max_idx = self.code_emb_momentum.size(0) - 1
+            code_ids = torch.clamp(code_ids, 0, max_idx)
 
-        # Ensure indices are in bounds
-        max_idx = self.code_emb_momentum.size(0) - 1
-        code_ids = torch.clamp(code_ids, 0, max_idx)
+            # Lookup embeddings
+            code_feat = self.code_emb_momentum[code_ids]
 
-        # Lookup embeddings
-        code_feat = self.code_emb_momentum[code_ids]
+            # Concatenate along feature dimension
+            combined = torch.cat([h, code_feat], dim=-1)
 
-        # Concatenate along feature dimension
-        combined = torch.cat([h, code_feat], dim=-1)
+            # Generate outputs
+            mu = self.mu_net(combined).clamp(*self.mu_bounds)
+            logvar = self.logvar_net(combined)
 
-        # Generate outputs
-        mu = self.mu_net(combined).clamp(*self.mu_bounds)
-        logvar = self.logvar_net(combined)
-
-        return mu, logvar
+            return mu, logvar
 
     def prior_regularization(self, mu):
         """Kinetic energy constraint"""
@@ -290,7 +311,7 @@ class ConfounderPrior(nn.Module):
         """Initialization via next existing code"""
         with torch.no_grad():
             sim = F.cosine_similarity(prototype_emb, self.code_emb.weight)
-            new_emb = 0.5*(self.code_emb.weight[sim.argmax()] + prototype_emb)
+            new_emb = 0.5 * (self.code_emb.weight[sim.argmax()] + prototype_emb)
             self.code_emb.weight.data[-1] = new_emb
 
     # Slightly better than before
@@ -307,6 +328,7 @@ class ConfounderPrior(nn.Module):
     def code_alignment_loss(self):
         """Tries to match momentum vs actual embeddings"""
         return F.mse_loss(self.code_emb_momentum, self.code_embed.weight.detach())
+
 
 """
 Few-shot phase: detecting new confounder
