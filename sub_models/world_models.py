@@ -221,14 +221,21 @@ class DistHead(nn.Module):
         # uniform noise mixing
         if mixing_ratio > 0:
             probs = F.softmax(logits, dim=-1)
+            # log_probs = F.log_softmax(logits, dim=-1) # Better numerical stability
+            # Avoid direct lo of small values
             mixed_probs = mixing_ratio * torch.ones_like(probs, dtype=self.dtype,
                                                          device=self.device) / self.stoch_dim + (
                                   1 - mixing_ratio) * probs
+            # log_mixed_probs = torch.log(mixing_ratio * torch.ones_like(log_probs.exp()) / self.stoch_dim +
+            #                         (1 - mixing_ratio) * log_probs.exp())
             logits = torch.log(mixed_probs)
+            # return log_mixed_probs
         return logits
 
     def forward_post(self, x):
         logits = self.post_head(x)
+        # Added to control exploding logs
+        # logits = torch.clamp(logits, min=-15.0, max=15.0)
         logits = rearrange(logits, "B L (K C) -> B L K C", K=self.stoch_dim)
         logits = self.unimix(logits, self.unimix_ratio)
         return logits
@@ -438,28 +445,37 @@ class WorldModel(nn.Module):
         self.symlog_twohot_loss_func = SymLogTwoHotLoss(num_classes=255, lower_bound=-20, upper_bound=20)
         self.categorical_kl_div_loss = CategoricalKLDivLossWithFreeBits(free_bits=1)
 
-        if config.PhasedTraining.SeparateOptimizers:
+        if config.Separate.SeparateOptimizers:
             # World model parameters (excluding causal model)
             self.world_parameters = [p for n, p in self.named_parameters()
                                      if not n.startswith('causal_model')]
             # Causal model parameters
             self.causal_parameters = self.causal_model.parameters()
 
+            # World model optimizer
             if config.Models.WorldModel.Optimiser == 'Laprop':
                 self.world_optimizer = LaProp(self.world_parameters, lr=config.Models.WorldModel.Laprop.LearningRate,
                                               eps=config.Models.WorldModel.Laprop.Epsilon,
                                               weight_decay=config.Models.WorldModel.Weight_decay)
-                self.causal_optimizer = LaProp(self.causal_parameters, lr=config.PhasedTraining.CausalModelLR,
-                                               weight_decay=config.Models.WorldModel.Weight_decay)
+
             elif config.Models.WorldModel.Optimiser == 'Adam':
                 self.world_optimizer = torch.optim.AdamW(self.world_parameters,
                                                          lr=config.Models.WorldModel.Adam.LearningRate,
                                                          weight_decay=config.Models.WorldModel.Weight_decay)
-                self.causal_optimizer = torch.optim.AdamW(self.causal_parameters,
-                                                          lr=config.PhasedTraining.CausalModelLR,
-                                                          weight_decay=config.Models.WorldModel.Weight_decay)
             else:
                 raise ValueError(f"Unknown optimiser: {config.Models.WorldModel.Optimiser}")
+
+            # Causal model optimizer
+            if config.Separate.CausalOptimizer == 'Laprop':
+                self.causal_optimizer = LaProp(self.causal_parameters, lr=config.Separate.CausalModelLR,
+                                               weight_decay=config.Models.WorldModel.Weight_decay)
+            elif config.Separate.CausalOptimizer == 'Adam':
+                self.causal_optimizer = torch.optim.AdamW(self.causal_parameters,
+                                                          lr=config.Separate.CausalModelLR,
+                                                          weight_decay=config.Models.WorldModel.Weight_decay)
+            else:
+                raise ValueError(f"Unknown optimiser: {config.Separate.CausalOptimizer}")
+
             # Separate schedulers
             self.lr_scheduler_world = torch.optim.lr_scheduler.LambdaLR(self.world_optimizer,
                                                                         lr_lambda=lambda step: 1.0)
@@ -489,17 +505,11 @@ class WorldModel(nn.Module):
         self.scaler = torch.cuda.amp.GradScaler(
             enabled=self.use_amp and config.Models.WorldModel.dtype is not torch.bfloat16)
 
-        # Stores phased training configuration
-        self.use_phased_training = config.PhasedTraining.Enabled
-        self.steps_per_phase = config.PhasedTraining.StepsPerPhase
-        self.phase_multiplier = config.PhasedTraining.PhaseMultiplier
-        self.alternation_frequency = config.PhasedTraining.AlternationFrequency
-
     def encode_obs(self, obs):
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
             embedding = self.encoder(obs)
             post_logits = self.dist_head.forward_post(embedding)
-            sample = self.straight_through_gradient(post_logits, sample_mode="random_sample")
+            sample = self.straight_through_gradient(post_logits, sample_mode="random_sample", identifier="502")
             flattened_sample = self.flatten_sample(sample)
         return flattened_sample
 
@@ -519,7 +529,7 @@ class WorldModel(nn.Module):
             code_emb_tr = quant_output_dict['quantized_tr'][:, -1:]  # Get transition codes
 
             prior_logits, _, _, _ = self.dist_head.forward_prior(modulated_feat, code_emb_tr, u_post)
-            prior_sample = self.straight_through_gradient(prior_logits, sample_mode="random_sample")
+            prior_sample = self.straight_through_gradient(prior_logits, sample_mode="random_sample", identifier="522")
             prior_flattened_sample = self.flatten_sample(prior_sample)
             # Add this line to ensure consistent sequence dimensions
             prior_flattened_sample = prior_flattened_sample[:, -1:]
@@ -529,7 +539,7 @@ class WorldModel(nn.Module):
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
             embedding = self.encoder(current_obs)
             post_logits = self.dist_head.forward_post(embedding)
-            sample = self.straight_through_gradient(post_logits, sample_mode="random_sample")
+            sample = self.straight_through_gradient(post_logits, sample_mode="random_sample", identifier="532")
             flattened_sample = self.flatten_sample(sample)
             if self.model == 'Transformer':
                 temporal_mask = get_subsequent_mask(latent)
@@ -542,7 +552,7 @@ class WorldModel(nn.Module):
             post_feat = self._obs_out_layers(x)
             post_stat = self._obs_stat_layer(post_feat)
             post_logits = post_stat.reshape(list(post_stat.shape[:-1]) + [self.categorical_dim, self.categorical_dim])
-            post_sample = self.straight_through_gradient(post_logits, sample_mode="random_sample")
+            post_sample = self.straight_through_gradient(post_logits, sample_mode="random_sample", identifier="545")
             post_flattened_sample = self.flatten_sample(post_sample)
 
         return post_flattened_sample, post_feat
@@ -556,7 +566,7 @@ class WorldModel(nn.Module):
             prior_logits = self.dist_head.forward_prior(dist_feat)
 
             # decoding
-            prior_sample = self.straight_through_gradient(prior_logits, sample_mode="random_sample")
+            prior_sample = self.straight_through_gradient(prior_logits, sample_mode="random_sample", identifier="559")
             prior_flattened_sample = self.flatten_sample(prior_sample)
             if log_video:
                 obs_hat = self.image_decoder(prior_flattened_sample)
@@ -571,40 +581,40 @@ class WorldModel(nn.Module):
 
     def straight_through_gradient(self, logits, sample_mode="random_sample",
                                   global_step=None, logger=None, identifier="default"):
-        # Track logit statistics if logger is provided
-        if logger is not None and global_step is not None:
-            # Basic statistics
-            with torch.no_grad():
-                if not torch.isnan(logits).any() and not torch.isinf(logits).any():
-                    logger.log(f"Logits/{identifier}/mean", logits.mean().item(), global_step=global_step)
-                    logger.log(f"Logits/{identifier}/std", logits.std().item(), global_step=global_step)
-                    logger.log(f"Logits/{identifier}/min", logits.min().item(), global_step=global_step)
-                    logger.log(f"Logits/{identifier}/max", logits.max().item(), global_step=global_step)
+        # # Track logit statistics if logger is provided
+        # if logger is not None and global_step is not None:
+        #     # Basic statistics
+        #     with torch.no_grad():
+        #         if not torch.isnan(logits).any() and not torch.isinf(logits).any():
+        #             logger.log(f"Logits/{identifier}/mean", logits.mean().item(), global_step=global_step)
+        #             logger.log(f"Logits/{identifier}/std", logits.std().item(), global_step=global_step)
+        #             logger.log(f"Logits/{identifier}/min", logits.min().item(), global_step=global_step)
+        #             logger.log(f"Logits/{identifier}/max", logits.max().item(), global_step=global_step)
 
-                    # Log distribution histogram periodically (every 100 steps)
-                    if global_step % 100 == 0:
-                        # Flatten and convert to numpy for histogram
-                        flat_logits = logits.detach().cpu().flatten().numpy()
-                        logger.log(f"Logits/{identifier}/histogram",
-                                   flat_logits, global_step=global_step)
-                else:
-                    # Record when NaN/Inf occurs
-                    logger.log(f"Logits/{identifier}/nan_inf_detected", 1.0, global_step=global_step)
+        #             # Log distribution histogram periodically (every 100 steps)
+        #             if global_step % 2 == 0:
+        #                 # Flatten and convert to numpy for histogram
+        #                 flat_logits = logits.detach().cpu().flatten().numpy()
+        #                 logger.log(f"Logits/{identifier}/histogram",
+        #                            flat_logits, global_step=global_step)
+        #         else:
+        #             # Record when NaN/Inf occurs
+        #             logger.log(f"Logits/{identifier}/nan_inf_detected", 1.0, global_step=global_step)
 
-                    # Save problematic tensor for analysis (careful with memory usage)
-                    if global_step % 100 == 0:  # Limit frequency
-                        nan_mask = torch.isnan(logits)
-                        inf_mask = torch.isinf(logits)
+        # Save problematic tensor for analysis (careful with memory usage)
+        # if global_step % 100 == 0:  # Limit frequency
+        #     nan_mask = torch.isnan(logits)
+        #     inf_mask = torch.isinf(logits)
 
-                        # Log counts of problematic values
-                        logger.log(f"Logits/{identifier}/nan_count", nan_mask.sum().item(), global_step=global_step)
-                        logger.log(f"Logits/{identifier}/inf_count", inf_mask.sum().item(), global_step=global_step)
+        #     # Log counts of problematic values
+        #     logger.log(f"Logits/{identifier}/nan_count", nan_mask.sum().item(), global_step=global_step)
+        #     logger.log(f"Logits/{identifier}/inf_count", inf_mask.sum().item(), global_step=global_step)
         # Safety clamp on logits
         # logits = torch.clamp(logits, min=-50.0, max=50.0)
 
         # Check for NaN or Inf values for debugging
         if torch.isnan(logits).any() or torch.isinf(logits).any():
-            print("WARNING: NaN or Inf in logits")
+            print("WARNING: NaN or Inf in logits from", identifier)
             # Replace problematic values
             logits = torch.where(torch.isnan(logits) | torch.isinf(logits),
                                  torch.zeros_like(logits), logits)
@@ -754,7 +764,8 @@ class WorldModel(nn.Module):
                                                                          u, global_step)
             context_prior_logits, _, _, _ = self.dist_head.forward_prior(mod_context_dist_feat,
                                                                          quantizer_output['hard_tr'], u)
-            context_prior_sample = self.straight_through_gradient(context_prior_logits, logger=logger, global_step=global_step,
+            context_prior_sample = self.straight_through_gradient(context_prior_logits, logger=logger,
+                                                                  global_step=global_step,
                                                                   identifier='context_prior')
             context_flattened_sample = self.flatten_sample(context_prior_sample)
 
@@ -791,7 +802,8 @@ class WorldModel(nn.Module):
                 # print("dist_feat_list[-1]:", dist_feat_list[-1].shape)
                 prior_logits, _, _, _ = self.dist_head.forward_prior(dist_feat_list[-1], quantizer_output_x['hard_tr'],
                                                                      u_x)
-                prior_sample = self.straight_through_gradient(prior_logits, logger=logger, global_step=global_step, identifier='prior_logits')
+                prior_sample = self.straight_through_gradient(prior_logits, logger=logger, global_step=global_step,
+                                                              identifier='prior_logits')
                 prior_flattened_sample = self.flatten_sample(prior_sample)
                 sample_list.append(prior_flattened_sample)
                 self.sample_buffer[:, i + 1:i + 2] = prior_flattened_sample
@@ -826,17 +838,12 @@ class WorldModel(nn.Module):
     def update(self, obs, action, reward, termination, global_step, epoch_step, logger=None):
         self.train()
         batch_size, batch_length = obs.shape[:2]
-        # Determine which phase we're in if phased training is enabled
-        if self.use_phased_training:
-            # 0 = world model phase, 1 = causal model phase
-            current_phase = (global_step // self.alternation_frequency) % 2
-        else:
-            current_phase = None  # Both models trained simultaneously
 
         with (torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp)):
             # encoding
             embedding = self.encoder(obs)
             post_logits = self.dist_head.forward_post(embedding)
+            # post_logits = torch.clamp(post_logits, min=-15.0, max=15.0) # May remove this
             sample = self.straight_through_gradient(post_logits, sample_mode="random_sample",
                                                     global_step=global_step, logger=logger, identifier="post_logits")
             flattened_sample = self.flatten_sample(sample)
@@ -851,56 +858,27 @@ class WorldModel(nn.Module):
             else:
                 dist_feat = self.sequence_model(flattened_sample, action)
 
-            # Phase-specific processing
-            if self.use_phased_training and current_phase == 0:  # World model phase
-                # Use causal model without gradients
-                with torch.no_grad():
-                    # 1. Pass the dist_feat to the causal model encoder -> quantizer -> confounding
-                    quantizer_output, u_post, causal_loss = self.causal_model(dist_feat, global_step, training=True)
-                    mod_dist_feat, inv_loss = self.causal_model.state_modulator(dist_feat,
-                                                                                quantizer_output['quantized_tr'],
-                                                                                u_post, global_step)
-                    prior_logits, total_tr_loss, aux_loss, sparsity_loss = \
-                        self.dist_head.forward_prior(mod_dist_feat, quantizer_output['quantized_tr'], u_post)
-                    # decoding reward and termination with dist_feat
-                    reward_hat, re_head_loss = self.reward_decoder(mod_dist_feat, quantizer_output['quantized_re'],
-                                                                   quantizer_output['q_re'])
-                    # World model losses
-                    causal_loss = torch.tensor(0.0, device=dist_feat.device)
-                    pred_loss = torch.tensor(0.0, device=dist_feat.device)
-                    re_head_loss = torch.tensor(0.0, device=dist_feat.device)
+            causal_dist_feat = dist_feat.detach()  # Detach to stop world model training
 
-            elif self.use_phased_training and current_phase == 1:  # Causal Model Phase
-                # Detach world model but allow causal model gradients
-                quantizer_output, u_post, causal_loss = self.causal_model(dist_feat.detach(), global_step,
-                                                                          training=True)
-                mod_dist_feat, inv_loss = self.causal_model.state_modulator(dist_feat.detach(),
-                                                                            quantizer_output['quantized_tr'],
-                                                                            u_post, global_step)
-                prior_logits, total_tr_loss, aux_loss, sparsity_loss = \
-                    self.dist_head.forward_prior(mod_dist_feat, quantizer_output['quantized_tr'], u_post)
-
-                reward_hat, re_head_loss = self.reward_decoder(mod_dist_feat,
-                                                               quantizer_output['quantized_re'],
-                                                               quantizer_output['q_re'])
-
-                # Only include causal model-related losses
-                pred_loss = 0.1 * inv_loss + 0.01 * aux_loss + 0.05 * sparsity_loss
-
-            else:  # Regular joint training (both models)
-                # Process with causal model (with gradients)
-                quantizer_output, u_post, causal_loss = self.causal_model(dist_feat, global_step, training=True)
-                mod_dist_feat, inv_loss = self.causal_model.state_modulator(dist_feat,
-                                                                            quantizer_output['quantized_tr'],
-                                                                            u_post, global_step)
-                prior_logits, total_tr_loss, aux_loss, sparsity_loss = \
-                    self.dist_head.forward_prior(mod_dist_feat, quantizer_output['quantized_tr'], u_post)
-
-                reward_hat, re_head_loss = self.reward_decoder(mod_dist_feat,
-                                                               quantizer_output['quantized_re'],
-                                                               quantizer_output['q_re'])
-
-                pred_loss = 0.1 * inv_loss + 0.01 * aux_loss + 0.05 * sparsity_loss
+            # 1. Pass the dist_feat to the causal model encoder -> quantizer -> confounding
+            quantizer_output, u_post, causal_loss, quant_loss, prior_loss, post_loss = self.causal_model(
+                causal_dist_feat, global_step, training=True)
+            # STATE MODULATOR has bidirection gradient flow
+            # Allow gradients form modulator to causal model
+            mod_dist_feat, inv_loss = self.causal_model.state_modulator(dist_feat,
+                                                                        quantizer_output['quantized_tr'],
+                                                                        u_post, global_step)
+            # PREDICTION HEADS (with directed gradient flow)
+            # For transition prediction - aloow gradients to modulator but not to causal model internals
+            prior_logits, total_tr_loss, aux_loss, sparsity_loss = \
+                self.dist_head.forward_prior(mod_dist_feat,
+                                             quantizer_output['quantized_tr'].detach(),  # Detach codes
+                                             u_post.detach())  # Detach posterior
+            # decoding reward and termination with dist_feat
+            reward_hat, re_head_loss = self.reward_decoder(mod_dist_feat,
+                                                           quantizer_output['quantized_re'].detach(),
+                                                           quantizer_output['q_re'].detach())
+            pred_loss = 0.1 * inv_loss + 0.01 * aux_loss + 0.05 * sparsity_loss
 
             # Common loss calculations
             reward_decoded = self.symlog_twohot_loss_func.decode(reward_hat)  # Convert to scalar values
@@ -919,66 +897,37 @@ class WorldModel(nn.Module):
             representation_loss, representation_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:],
                                                                                            prior_logits[:,
                                                                                            :-1].detach())
-            # Build total loss based on current phase
-            if self.use_phased_training and current_phase == 0:  # World model phase
-                total_loss = reconstruction_loss + reward_loss + termination_loss + dynamics_loss + 0.1 * representation_loss
-            elif self.use_phased_training and current_phase == 1:  # Causal model phase
-                total_loss = causal_loss + pred_loss + re_head_loss + reward_loss + termination_loss
-            else:  # Regular joint training
-                total_loss = reconstruction_loss + reward_loss + termination_loss + dynamics_loss + \
-                             0.1 * representation_loss + causal_loss + pred_loss + re_head_loss
+            # Separate world model losses from causal model losses
+            # Added a dynamics loss weight 0.8
+            world_model_loss = reconstruction_loss + reward_loss + termination_loss + dynamics_loss + 0.1 * representation_loss
+            causal_model_loss = causal_loss + pred_loss + re_head_loss
             # total_loss = reconstruction_loss + reward_loss + termination_loss + dynamics_loss + 0.1 * representation_loss + causal_loss + pred_loss + re_head_loss
-            # gradient descent
-            # Phase-specific optimizer steps
-            if self.use_phased_training and hasattr(self, 'world_optimizer') and hasattr(self, 'causal_optimizer'):
-                self.scaler.scale(total_loss).backward()
-                if current_phase == 0:  # World Model Phase
-                    self.scaler.unscale_(self.world_optimizer)
-                    torch.nn.utils.clip_grad_norm_([p for n, p in self.named_parameters()
-                                                    if not n.startswith('causal_model')],
-                                                   max_norm=self.max_grad_norm)
-                    self.scaler.step(self.world_optimizer)
-                    self.scaler.update()
-                    self.world_optimizer.zero_grad(set_to_none=True)
-                    self.lr_scheduler_world.step()
-                    self.warmup_scheduler_world.dampen()
 
-                else:  # Causal Model Phase
-                    self.scaler.unscale_(self.causal_optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.causal_model.parameters(),
-                                                   max_norm=self.max_grad_norm)
-                    self.scaler.step(self.causal_optimizer)
-                    self.scaler.update()
-                    self.causal_optimizer.zero_grad(set_to_none=True)
-                    self.lr_scheduler_causal.step()
-                    self.warmup_scheduler_causal.dampen()
+            # First backward for world model
+            self.scaler.scale(world_model_loss).backward(retain_graph=True)  # Retain graph needs to be true
 
-            else:  # Regular joint optimization
-                self.scaler.scale(total_loss).backward()
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=self.max_grad_norm)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-                self.optimizer.zero_grad(set_to_none=True)
-                self.lr_scheduler.step()
-                self.warmup_scheduler.dampen()
+            # Update world model parameters
+            self.scaler.unscale_(self.world_optimizer)
+            torch.nn.utils.clip_grad_norm_([p for n, p in self.named_parameters()
+                                            if not n.startswith('causal_model')],
+                                           max_norm=self.max_grad_norm)
+            self.scaler.step(self.world_optimizer)
+            self.world_optimizer.zero_grad(set_to_none=True)
+            self.lr_scheduler_world.step()
+            self.warmup_scheduler_world.dampen()
 
-        if logger is not None and self.use_phased_training:
-            if current_phase == 0:
-                logger.log("WorldModel/world_phase_loss", total_loss.item(), global_step=global_step)
-            else:
-                logger.log("WorldModel/causal_phase_loss", total_loss.item(), global_step=global_step)
+            # Backward for causal model
+            self.scaler.scale(causal_model_loss).backward()
+            self.scaler.unscale_(self.causal_optimizer)
+            torch.nn.utils.clip_grad_norm_(self.causal_model.parameters(),
+                                           max_norm=self.max_grad_norm)
+            self.scaler.step(self.causal_optimizer)
+            self.causal_optimizer.zero_grad(set_to_none=True)
+            self.lr_scheduler_causal.step()
+            self.warmup_scheduler_causal.dampen()
 
-            # Track gradients for debugging
-            if (global_step % 1000) == 0:
-                world_grad_norm = torch.nn.utils.clip_grad_norm_(
-                    [p for n, p in self.named_parameters() if not n.startswith('causal_model')],
-                    max_norm=float('inf'))
-                causal_grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.causal_model.parameters(), max_norm=float('inf'))
-
-                logger.log("Gradients/world_norm", world_grad_norm.item(), global_step=global_step)
-                logger.log("Gradients/causal_norm", causal_grad_norm.item(), global_step=global_step)
+            # Update scaler afterboth optimizers have been stepped
+            self.scaler.update()
 
         if (global_step + epoch_step) % self.save_every_steps == 0:  # and global_step != 0:
             sample_obs = torch.clamp(obs[:3, 0, :] * 255, 0, 255).permute(0, 2, 3,
@@ -1004,5 +953,5 @@ class WorldModel(nn.Module):
 
         return reconstruction_loss.item(), reward_loss.item(), termination_loss.item(), \
             dynamics_loss.item(), dynamics_real_kl_div.item(), representation_loss.item(), \
-            representation_real_kl_div.item(), total_loss.item()
+            representation_real_kl_div.item(), quant_loss.item(), post_loss.item(), prior_loss.item(), causal_model_loss.item(), world_model_loss.item()
 

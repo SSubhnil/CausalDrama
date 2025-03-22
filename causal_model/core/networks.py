@@ -130,7 +130,7 @@ class SparseCodebookMoE(nn.Module):
 
 
 class ImportanceWeightedMoE(nn.Module):
-    def __init__(self, num_experts, hidden_dim, code_dim, quantizer, top_k=2, importance_reg=0.01):
+    def __init__(self, num_experts, hidden_state_dim, hidden_dim, code_dim, quantizer, top_k=2, importance_reg=0.01):
         super().__init__()
         # Check codebook size first
         codebook_size = quantizer.tr_quantizer.codebook.data.size(0)
@@ -154,9 +154,9 @@ class ImportanceWeightedMoE(nn.Module):
         # Keep your existing expert structure
         self.experts = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(hidden_dim + code_dim, 4 * hidden_dim),
+                nn.Linear(hidden_state_dim + code_dim, 2 * hidden_state_dim),
                 nn.GELU(),
-                nn.Linear(4 * hidden_dim, 1024 // num_experts)
+                nn.Linear(2 * hidden_state_dim, 1024 // num_experts)
             ) for _ in range(num_experts)
         ])
 

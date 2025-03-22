@@ -3,6 +3,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from line_profiler import profile
 
 
 class StateModulator(nn.Module):
@@ -22,14 +23,14 @@ class StateModulator(nn.Module):
         # Scale and Shift MLPs
         # h_world modulation components - scale and shift
         self.scale_mlp = nn.Sequential(
-            nn.Linear(code_dim + conf_dim, hidden_dim),
+            nn.Linear(code_dim + conf_dim, hidden_state_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(hidden_state_dim, hidden_state_dim),
             nn.Sigmoid()  # [0,1] scaling
         )
-        self.shift_mlp = nn.Sequential(nn.Linear(code_dim + conf_dim, hidden_dim),
+        self.shift_mlp = nn.Sequential(nn.Linear(code_dim + conf_dim, hidden_state_dim),
                                        nn.SiLU(),
-                                       nn.Linear(hidden_dim, hidden_dim)
+                                       nn.Linear(hidden_state_dim, hidden_state_dim)
                                        )
 
         # Orthogonal initialization
@@ -44,6 +45,7 @@ class StateModulator(nn.Module):
         self.sigma_decay = 0.9995
         self.register_buffer('step', torch.tensor(0))
 
+    @profile
     def forward(self, h, code_emb, u, global_step):
         if h.shape[1] != code_emb.shape[1]:
             if h.shape[1] < code_emb.shape[1]:
@@ -63,8 +65,8 @@ class StateModulator(nn.Module):
 
         # Generate scale/shift with gradient gates
         """May not be a good idea to detach here"""
-        scale = self.scale_mlp(modulation_input)  # Detach world model
-        shift = self.shift_mlp(modulation_input)
+        scale = torch.clamp(self.scale_mlp(modulation_input), min=0.1, max=10.0)
+        shift = torch.clamp(self.shift_mlp(modulation_input), min=-10.0, max=10.0)
 
         # Verify dimensions before applying transformation
         assert h.shape[0] == scale.shape[0], f"Batch dim mismatch: h={h.shape[0]}, scale={scale.shape[0]}"
@@ -88,8 +90,9 @@ class StateModulator(nn.Module):
             h_modulated_noisy = scale * h_transformed_noisy + shift
 
             # Invariance loss: modulated output should be similar despite input noise
-            inv_loss = (h_modulated - h_modulated_noisy).pow(2).mean() / (h_modulated.detach().pow(2).mean()
-                                                                          + 1e-7)
+            # inv_loss = (h_modulated - h_modulated_noisy).pow(2).mean() / (h_modulated.detach().pow(2).mean()
+                                                                        #   + 1e-7)
+            inv_loss = F.smooth_l1_loss(h_modulated, h_modulated_noisy) # Stable invariance loss
             # Update sigma for annealing
             self.step += 1
             self.sigma.data = torch.max(
@@ -119,6 +122,7 @@ class MoETransitionHead(nn.Module):
             # Create ImportanceWeightedMoE with parameters from original MOE
             self.moe = ImportanceWeightedMoE(
                 num_experts=num_experts,
+                hidden_state_dim=hidden_state_dim,
                 hidden_dim=hidden_dim,
                 code_dim=code_dim,
                 quantizer=quantizer,
@@ -127,11 +131,11 @@ class MoETransitionHead(nn.Module):
             )
         else:
             # Use the original MoE
-            self.moe = SparseCodebookMoE(num_experts=self.predictor_params.Transition.NumOfExperts,
-                                         hidden_dim=self.predictor_params.Transition.HiddenDim,
+            self.moe = SparseCodebookMoE(num_experts=self.num_experts,
+                                         hidden_dim=self.hidden_dim,
                                          code_dim=self.code_dim,
                                          quantizer=self.quantizer,
-                                         top_k=self.predictor_params.Transition.TopK,
+                                         top_k=self.top_k,
                                          )
 
         # Confounding effect module
@@ -162,16 +166,19 @@ class MoETransitionHead(nn.Module):
         nn.init.normal_(self.conf_mask[0].weight, std=0.01)
         nn.init.zeros_(self.conf_mask[0].bias)  # Also initialize bias if needed
         # Register hook on the Linear layer's weight parameter specifically
-        self.conf_mask[0].weight.register_hook(lambda grad: grad * (torch.abs(grad) > 0.1).float())
+        # self.conf_mask[0].weight.register_hook(lambda grad: grad * (torch.abs(grad) > 0.1).float())
+        self.conf_mask[0].weight.register_hook(lambda grad: grad * torch.sigmoid(10 * torch.abs(grad)))
 
+    @profile
     def forward(self, h_modulated, code_emb, u):
         # Get stable code embeddings
-        code_emb_stable = code_emb  # .detach()
+        code_emb_stable = code_emb.detach()  # .detach()
 
         # print("weighted_h shape nsitionHead:", h_modulated.shape)
         # print("code_emb shape in MoETransiin MoETrationHead:", code_emb_stable.shape)
         # Process through MoE
         moe_out, aux_loss, importance_stats = self.moe(h_modulated, code_emb_stable)
+        moe_out = torch.clamp(moe_out, -100, 100)  # Add reasonable bounds
 
         # Create modulation input
         modulation_input = torch.cat([code_emb_stable, u], dim=-1)

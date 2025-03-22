@@ -59,7 +59,6 @@ def monitor_memory_growth(steps_history=100):
     return current_mem
 
 
-
 def train_world_model_step(replay_buffer: ReplayBuffer, world_model: WorldModel, batch_size, batch_length, logger,
                            epoch, global_step):
     epoch_reconstruction_loss_list = []
@@ -69,29 +68,19 @@ def train_world_model_step(replay_buffer: ReplayBuffer, world_model: WorldModel,
     epoch_dynamics_real_kl_div_list = []
     epoch_representation_loss_list = []
     epoch_representation_real_kl_div_list = []
-    epoch_total_loss_list = []
+    epoch_quant_loss_list = []
+    epoch_confounder_loss_list = []
+    epoch_causal_loss_list = []
+    epoch_world_loss_list = []
 
-    # Determine if using phased training and which phase we're in
-    if world_model.use_phased_training:
-        # 0 = world model phase, 1 = causal model phase
-        current_phase = (global_step // world_model.alternation_frequency) % 2
-
-        # Adjust number of epochs based on phase
-        actual_epochs = epoch * world_model.phase_multiplier
-
-        # Log current training phase
-        if logger is not None:
-            logger.log("Training/Phase", current_phase, global_step=global_step)
-    else:
-        actual_epochs = epoch
-
-    for e in range(actual_epochs):
+    for e in range(epoch):
         obs, action, reward, termination = replay_buffer.sample(batch_size, batch_length, imagine=False)
         reconstruction_loss, reward_loss, termination_loss, \
             dynamics_loss, dynamics_real_kl_div, representation_loss, \
-            representation_real_kl_div, total_loss = world_model.update(obs, action, reward, termination,
-                                                                        global_step=global_step, epoch_step=e,
-                                                                        logger=logger)
+            representation_real_kl_div, quant_loss, confounder_loss, causal_model_loss, world_model_loss = world_model.update(
+            obs, action, reward, termination,
+            global_step=global_step, epoch_step=e,
+            logger=logger)
 
         epoch_reconstruction_loss_list.append(reconstruction_loss)
         epoch_reward_loss_list.append(reward_loss)
@@ -100,7 +89,10 @@ def train_world_model_step(replay_buffer: ReplayBuffer, world_model: WorldModel,
         epoch_dynamics_real_kl_div_list.append(dynamics_real_kl_div)
         epoch_representation_loss_list.append(representation_loss)
         epoch_representation_real_kl_div_list.append(representation_real_kl_div)
-        epoch_total_loss_list.append(total_loss)
+        epoch_quant_loss_list.append(quant_loss)
+        epoch_confounder_loss_list.append(confounder_loss)
+        epoch_causal_loss_list.append(causal_model_loss)
+        epoch_world_loss_list.append(world_model_loss)
     if logger is not None:
         logger.log("WorldModel/reconstruction_loss", np.mean(epoch_reconstruction_loss_list), global_step=global_step)
         # logger.log("WorldModel/augmented_reconstruction_loss", augmented_reconstruction_loss.item(), global_step=global_step)
@@ -111,8 +103,10 @@ def train_world_model_step(replay_buffer: ReplayBuffer, world_model: WorldModel,
         logger.log("WorldModel/representation_loss", np.mean(epoch_representation_loss_list), global_step=global_step)
         logger.log("WorldModel/representation_real_kl_div", np.mean(epoch_representation_real_kl_div_list),
                    global_step=global_step)
-        logger.log("WorldModel/total_loss", np.mean(epoch_total_loss_list), global_step=global_step)
-
+        logger.log("WorldModel/quant_loss", np.mean(epoch_quant_loss_list), global_step=global_step)
+        logger.log("WorldModel/confounder_loss", np.mean(epoch_confounder_loss_list), global_step=global_step)
+        logger.log("WorldModel/causal_model_loss", np.mean(epoch_causal_loss_list), global_step=global_step)
+        logger.log("WorldModel/world_model_loss", np.mean(epoch_world_loss_list), global_step=global_step)
 
 
 @torch.no_grad()
@@ -145,7 +139,6 @@ def world_model_imagine_data(replay_buffer: ReplayBuffer,
             logger=logger, global_step=global_step
         )
     return latent, action, old_logits, context_latent, sample_reward, sample_termination, reward_hat, termination_hat
-
 
 
 def joint_train_world_model_agent(config, logdir,
@@ -225,7 +218,7 @@ def joint_train_world_model_agent(config, logdir,
             # Use following condition to run games not in Atari100k
             # if config.BasicSettings.Env_name.startswith('ALE') and game_benchmark_df is not None:
             logger.log(f"episode/normalised score", (sum_reward - game_benchmark_df['Random']) / (
-                        game_benchmark_df['Human'] - game_benchmark_df['Random']), global_step=total_steps)
+                    game_benchmark_df['Human'] - game_benchmark_df['Random']), global_step=total_steps)
             for algorithm in game_benchmark_df.index[2:]:
                 denominator = game_benchmark_df[algorithm] - game_benchmark_df['Random']
                 if denominator != 0:
@@ -255,7 +248,10 @@ def joint_train_world_model_agent(config, logdir,
 
         if replay_buffer.ready('behaviour') and total_steps % (
                 config.JointTrainAgent.TrainAgentEverySteps // config.JointTrainAgent.NumEnvs) == 0 and total_steps <= config.JointTrainAgent.FreezeBehaviourAfterSteps:
-            log_video = total_steps % (config.JointTrainAgent.SaveEverySteps // config.JointTrainAgent.NumEnvs) == 0
+            should_log_video = total_steps % (
+                        config.JointTrainAgent.SaveEverySteps // config.JointTrainAgent.NumEnvs) == 0
+            # print(f"Step {total_steps}: Should log video: {should_log_video}")
+            log_video = should_log_video
 
             imagine_latent, agent_action, old_logits, context_latent, context_reward, context_termination, imagine_reward, imagine_termination = world_model_imagine_data(
                 replay_buffer=replay_buffer,

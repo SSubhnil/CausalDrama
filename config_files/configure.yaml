@@ -19,13 +19,14 @@ Evaluate:
    DuringTraining: False
    EverySteps: 1000
 
-PhasedTraining: # Alternate training of the Causal model and world model
+Separate: # Alternate training of the Causal model and world model
   Enabled: True
   StepsPerPhase: 1       # How many steps to stay in each phase
   AlternationFrequency: 1  # Switch phase every 4 steps (1=every step)
   PhaseMultiplier: 2       # Train the active component twice
   SeparateOptimizers: True
-  CausalModelLR: 5e-5      # Separate learning rate for causal model
+  CausalModelLR: 5.0e-5      # Separate learning rate for causal model
+  CausalOptimizer: Adam # Adam or Laprop
 
 JointTrainAgent:
   SampleMaxSteps: 100000 # Just to make sure the last episode will finish, no training after 100k
@@ -44,15 +45,12 @@ JointTrainAgent:
   TrainAgentEverySteps: 1
   FreezeWorldModelAfterSteps: 100000
   FreezeBehaviourAfterSteps: 100000
-  SaveEverySteps: 2000
+  SaveEverySteps: 1500
   SaveModels: True
   Tau: 10
   ImaginationTau: 10
   Alpha: 1.0 # High focus on penalising high imagine counts regardless of train counts, less probability to be sampled
   Beta: 1.0 # High focus on penalising
-
-  CausalWarmUp: 2000              # Causal model pretraining
-  AlternateTrainEvery: 5          # Alternate WM/causal training
 
 Models:
   UseCausal: True
@@ -63,7 +61,7 @@ Models:
     Act: SiLU
     CategoricalDim: 32
     ClassDim: 32
-    HiddenStateDim: 512
+    HiddenStateDim: 1024
     Optimiser: Laprop
     LatentDiscreteType: naive
     Max_grad_norm: 1000
@@ -147,11 +145,11 @@ Models:
       MinLogVar: -6.0         # Posterior variance bounds
       MaxLogVar: 0.0
       PriorMomentum: 0.97
-      PriorRegWeight: 0.01           # Regularization loss weight
+      PriorRegWeight: 0.01      # Regularization loss weight
       PriorCodeAlign: 0.1       # Weight for code alignment loss
       PostReg: 0.001          # Posterior L2 regularization
       PostCodeSparsity: 0.01  #
-      PostKLWeight: 0.5
+      PostKLWeight: 0.3
 
     Modulation:
       MaskInitScale: 0.5      # Initial scale for modulation
@@ -161,7 +159,7 @@ Models:
 
     Predictors:
       ComputeInvarianceLoss: True # Enforces invariance in codes
-      InvarianceWeight: 0.3     # Mechanism invariance loss
+      InvarianceWeight: 0.2     # Mechanism invariance loss
       TransitionWeight: 1.0 # Main objective - next state prediction
       RewardWeight: 1.0         # Main objective - reward prediction
       TerminationWeight: 0.5    # Secondary Objective - episode termination
@@ -189,7 +187,7 @@ Models:
 
   Agent:
     dtype: float32
-    Policy: PPO # AC or PPO
+    Policy: AC # AC or PPO
     Unimix_ratio: 0
     AC:
       NumLayers: 3
@@ -236,6 +234,6 @@ Models:
         HiddenUnits: 512 # Andrychowicz2020 wider critic network seems better
 Wandb:
   Init:
-    Mode: disabled
-    Project: Causal_Mamba
+    Mode: online
+    Project: Causal_Mamba_optimize
 n: standard

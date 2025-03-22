@@ -210,7 +210,7 @@ class DualVQQuantizer(nn.Module):
                 p_tr_cond_re = F.log_softmax(logits_tr_from_re /
                                              self.tr_quantizer.temperature, dim=-1)
 
-                kl_loss = F.kl_div(p_tr_cond_re, q_tr.detach(), reduction='batchmean',
+                kl_loss = F.kl_div(p_tr_cond_re, q_tr, reduction='batchmean',
                                    log_target=False)
                 # Questionable reverse KL -> might remove
                 # reverse_kl = F.kl_div(q_tr.log(), p_tr_cond_re.detach().exp(), reduction='batchmean')

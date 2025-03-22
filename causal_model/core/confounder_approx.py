@@ -108,7 +108,7 @@ class ConfounderPosterior(nn.Module):
     Components:
         - Code-conditioned variational posterior Q(u | h, c)
         - Hyper-network for parameter generation
-        - Affine transformations code specific \phi_c(u)
+        - Affine transformations code specific phi_c(u)
     """
 
     def __init__(self, code_dim: int, conf_dim: int, num_codes: int,
@@ -181,17 +181,17 @@ class ConfounderPosterior(nn.Module):
             logvar_prior: Prior log variance
         """
         # Check dimensions
-        self.check_dimensions(h, (h.size(0), h.size(1), self.code_dim), "h input")
-        self.check_dimensions(code_emb, (code_emb.size(0), code_emb.size(1), self.code_dim), "code_emb")
+        # self.check_dimensions(h, (h.size(0), h.size(1), self.code_dim), "h input")
+        # self.check_dimensions(code_emb, (code_emb.size(0), code_emb.size(1), self.code_dim), "code_emb")
 
         with (torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=True)):
             # Generate posterior parameters
             # mu_post = self.confounder_post_mu_net(h, code_emb)
             mu_post = torch.clamp(self.confounder_post_mu_net(h, code_emb), min=-10.0, max=10.0)
-            self.check_dimensions(mu_post, (mu_post.size(0), mu_post.size(1), self.conf_dim), "mu_post")
+            # self.check_dimensions(mu_post, (mu_post.size(0), mu_post.size(1), self.conf_dim), "mu_post")
 
             logvar_post = self.confounder_post_logvar_net(h, code_emb)
-            self.check_dimensions(logvar_post, (logvar_post.size(0), logvar_post.size(1), self.conf_dim), "logvar_post")
+            # self.check_dimensions(logvar_post, (logvar_post.size(0), logvar_post.size(1), self.conf_dim), "logvar_post")
 
             # Reparameterization trick
             u_post = self.reparameterize(mu_post, logvar_post)
