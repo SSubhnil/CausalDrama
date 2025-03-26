@@ -179,7 +179,7 @@ class ImportanceWeightedMoE(nn.Module):
 
     def forward(self, h, code_emb):
         """
-        Forward pass for ImportanceWeightedMoE.
+        Forward pass for ImportanceWeightedMoE using all experts.
 
         Args:
             h: Hidden state tensor, shape [B, D] or [B, T, D]
@@ -195,11 +195,11 @@ class ImportanceWeightedMoE(nn.Module):
             else:
                 code_emb = code_emb.reshape(code_emb.shape[0], -1)
 
-        # 3. Verify batch dimensions match after reshaping
+        # 2. Verify batch dimensions match after reshaping
         if h.shape[0] != code_emb.shape[0]:
             raise ValueError(f"Batch dimensions don't match after reshaping: {h.shape[0]} vs {code_emb.shape[0]}")
 
-        # 2. Compute router logits (cosine similarity)
+        # 3. Compute router logits (cosine similarity)
         is_3d = h.dim() == 3
         code_anchor_norm = F.normalize(self.code_anchor, p=2, dim=1)
 
@@ -216,23 +216,15 @@ class ImportanceWeightedMoE(nn.Module):
                 code_anchor_norm.t()
             ) * 0.125
 
-        # 3. Get expert assignments with top-k selection
+        # 4. Get FULL expert weight distribution (no top-k filtering)
         expert_weights = F.gumbel_softmax(router_logits, tau=0.1, hard=False)
-        safe_top_k = max(1, min(self.top_k, self.num_experts, expert_weights.size(-1)))
-        topk_weights, topk_indices = torch.topk(expert_weights, safe_top_k, dim=-1)
 
-        # Create and apply mask for selected experts
-        expert_mask = torch.zeros_like(expert_weights)
-        for k in range(safe_top_k):
-            expert_mask.scatter_(-1, topk_indices[..., k:k + 1], 1.0)
-        expert_weights = expert_weights * expert_mask
-
-        # 4. Initialize output tensor
+        # 5. Initialize output tensor
         batch_size = h.shape[0]
         seq_len = h.shape[1] if is_3d else 1
         full_output = torch.zeros(batch_size, seq_len, 1024, device=h.device)
 
-        # 5. Process through experts with importance weighting
+        # 6. Process through ALL experts with importance weighting
         importance_entropies = []
         temperature = torch.clamp(self.importance_temperature, min=0.1, max=5.0)
 
@@ -259,52 +251,30 @@ class ImportanceWeightedMoE(nn.Module):
                 importance = importance.view(1, -1)
             weighted_h = h * importance
 
-            # Verify shapes before concatenation
-            if weighted_h.shape != h_shape_orig:
-                raise ValueError(f"Importance weighting changed tensor shape: {weighted_h.shape} vs {h.shape}")
-
             # Track entropy for regularization
             importance_entropy = -(importance.flatten() * torch.log(importance.flatten() + 1e-8)).sum()
             importance_entropies.append(importance_entropy.item())
 
-            # print("weighted_h shape in ImportanceWeighted:", weighted_h.shape)
-            # print("code_emb shape in ImportanceWeighted:", code_emb.shape)
-            # Process input through expert with safe concatenation
-            try:
-                expert_input = torch.cat([weighted_h, code_emb], dim=-1)
-            except RuntimeError as e:
-                # Fallback handling for dimension mismatch
-                if weighted_h.shape[0] != code_emb.shape[0]:
-                    raise ValueError(
-                        f"Cannot concatenate tensors with mismatched batch sizes: {weighted_h.shape} vs {code_emb.shape}")
-                else:
-                    raise e
+            # Process input through expert
+            expert_input = torch.cat([weighted_h, code_emb], dim=-1)
             output = expert(expert_input)
 
-            # Add weighted contribution to result
+            # Add weighted contribution to result (using DIRECT expert weights)
             slice_size = 1024 // self.num_experts
             start_idx = i * slice_size
             end_idx = (i + 1) * slice_size
 
-            # Get weight for this expert
-            expert_weight = torch.zeros_like(topk_weights[..., 0])
-            for k in range(safe_top_k):
-                expert_weight = torch.where(
-                    topk_indices[..., k] == i,
-                    topk_weights[..., k],
-                    expert_weight
-                )
-
-            # Add broadcasting dimension if needed
-            if expert_weight.dim() < output.dim():
-                expert_weight = expert_weight.unsqueeze(-1)
+            # Extract this expert's weight directly from the full distribution
+            expert_weight = expert_weights[..., i:i + 1]
 
             # Add weighted output
             full_output[..., start_idx:end_idx] += output[..., :slice_size] * expert_weight
 
-        # 6. Calculate auxiliary losses
+        # 7. Calculate auxiliary losses
         expert_counts = expert_weights.sum(0)
         expert_load = expert_counts / (expert_counts.sum() + 1e-8)
+
+        # Modified routing loss for balance - encourage more uniform usage
         routing_loss = 0.5 * (expert_counts.std() + (-expert_load * torch.log(expert_load + 1e-8)).sum())
 
         # Calculate average importance entropy
