@@ -145,8 +145,8 @@ Models:
       MinLogVar: -6.0         # Posterior variance bounds
       MaxLogVar: 0.0
       PriorMomentum: 0.97
-      PriorRegWeight: 0.01      # Regularization loss weight
-      PriorCodeAlign: 0.1       # Weight for code alignment loss
+      PriorRegWeight: 0.01    # Regularization loss weight
+      PriorCodeAlign: 0.1     # Weight for code alignment loss
       PostReg: 0.001          # Posterior L2 regularization
       PostCodeSparsity: 0.01  #
       PostKLWeight: 0.3
@@ -159,7 +159,7 @@ Models:
 
     Predictors:
       ComputeInvarianceLoss: True # Enforces invariance in codes
-      InvarianceWeight: 0.2     # Mechanism invariance loss
+      InvarianceWeight: 0.1     # Mechanism invariance loss
       TransitionWeight: 1.0 # Main objective - next state prediction
       RewardWeight: 1.0         # Main objective - reward prediction
       TerminationWeight: 0.5    # Secondary Objective - episode termination
@@ -167,7 +167,7 @@ Models:
         UseImportanceWeightedMoE: True
         NumOfExperts: 8
         TopK: 3
-        HiddenDim: 512
+        HiddenDim: 512    # Keep it 512 for now. The posterior is sensitive to this size.
         MaskSparsityWeight: 0.05
         AuxiliaryWeight: 0.1
 
@@ -187,7 +187,7 @@ Models:
 
   Agent:
     dtype: float32
-    Policy: AC # AC or PPO
+    Policy: PPO # AC or PPO
     Unimix_ratio: 0
     AC:
       NumLayers: 3
