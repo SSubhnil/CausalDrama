@@ -105,7 +105,7 @@ class StateModulator(nn.Module):
 
 
 class MoETransitionHead(nn.Module):
-    def __init__(self, hidden_state_dim, hidden_dim, code_dim, conf_dim, num_experts, top_k, state_modulator, quantizer,
+    def __init__(self, hidden_state_dim, hidden_dim, code_dim, conf_dim, num_experts, top_k, state_modulator, codebook_data,
                  compute_inv_loss=False,
                  use_importance_weighted_moe=True, importance_reg=0.01):
         super().__init__()
@@ -125,7 +125,7 @@ class MoETransitionHead(nn.Module):
                 hidden_state_dim=hidden_state_dim,
                 hidden_dim=hidden_dim,
                 code_dim=code_dim,
-                quantizer=quantizer,
+                codebook_data=codebook_data,
                 top_k=top_k,
                 importance_reg=importance_reg
             )
@@ -172,10 +172,10 @@ class MoETransitionHead(nn.Module):
     @profile
     def forward(self, h_modulated, code_emb, u):
         # Get stable code embeddings
-        code_emb_stable = code_emb.detach()  # .detach()
+        code_emb_stable = code_emb  # .detach()
 
         # print("weighted_h shape nsitionHead:", h_modulated.shape)
-        # print("code_emb shape in MoETransitionHead:", code_emb_stable.shape)
+        # print("code_emb shape in MoETransiin MoETrationHead:", code_emb_stable.shape)
         # Process through MoE
         moe_out, aux_loss, importance_stats = self.moe(h_modulated, code_emb_stable)
         moe_out = torch.clamp(moe_out, -100, 100)  # Add reasonable bounds

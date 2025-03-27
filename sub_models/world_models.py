@@ -404,6 +404,7 @@ class WorldModel(nn.Module):
             params=config,
             device=self.device
         )
+        codebook_data = self.causal_model.quantizer.tr_quantizer.codebook.data.clone()
 
         """
         PREDICTOR HEADS
@@ -411,10 +412,10 @@ class WorldModel(nn.Module):
             Loss weights: aux_loss, Sparsity_loss
         """
         self.predictor_params = config.Models.CausalModel.Predictors
-        self.loss_weights.update({
-            'tr_aux_loss': self.predictor_params.Transition.AuxiliaryWeight,
-            'tr_sparsity_weight': self.predictor_params.Transition.MaskSparsityWeight
-        })
+        # self.loss_weights.update({
+        #     'tr_aux_loss': self.predictor_params.Transition.AuxiliaryWeight,
+        #     'tr_sparsity_weight': self.predictor_params.Transition.MaskSparsityWeight
+        # })
         self.state_modulator = StateModulator(self.hidden_state_dim, self.predictor_params.Transition.HiddenDim,
                                               self.code_dim_tr, self.confounder_params.ConfDim,
                                               self.predictor_params.ComputeInvarianceLoss)
@@ -426,7 +427,7 @@ class WorldModel(nn.Module):
                                          num_experts=self.predictor_params.Transition.NumOfExperts,
                                          top_k=self.predictor_params.Transition.TopK,
                                          state_modulator=self.state_modulator,
-                                         quantizer=self.quantizer,
+                                         codebook_data=codebook_data,
                                          use_importance_weighted_moe=self.predictor_params.Transition.UseImportanceWeightedMoE
                                          )
 
@@ -573,7 +574,7 @@ class WorldModel(nn.Module):
             last_dist_feat = dist_feat[:, -1:]
             # Add causal model processing
             quant_output_dict, u_post, _ = self.causal_model(last_dist_feat, 1000)
-            modulated_feat, _ = self.causal_model.state_modulator(last_dist_feat, quant_output_dict['quantized_tr'],
+            modulated_feat, _ = self.state_modulator(last_dist_feat, quant_output_dict['quantized_tr'],
                                                                   u_post, 1000)
             code_emb_tr = quant_output_dict['quantized_tr'][:, -1:]  # Get transition codes
 
@@ -809,7 +810,7 @@ class WorldModel(nn.Module):
 
             # Modulated Context Dist Feat
             quantizer_output, u, _ = self.causal_model(context_dist_feat, global_step)
-            mod_context_dist_feat, _ = self.causal_model.state_modulator(context_dist_feat, quantizer_output['hard_tr'],
+            mod_context_dist_feat, _ = self.state_modulator(context_dist_feat, quantizer_output['hard_tr'],
                                                                          u, global_step)
             context_prior_logits, _, _, _ = self.dist_head.forward_prior(mod_context_dist_feat,
                                                                          quantizer_output['hard_tr'], u)
@@ -835,7 +836,7 @@ class WorldModel(nn.Module):
 
                 # Process and store modulated
                 quantizer_output_x, u_x, _ = self.causal_model(dist_feat, global_step)
-                dist_feat, _ = self.causal_model.state_modulator(dist_feat, quantizer_output_x['hard_tr'], u_x,
+                dist_feat, _ = self.state_modulator(dist_feat, quantizer_output_x['hard_tr'], u_x,
                                                                  global_step)
                 dist_feat_list.append(dist_feat)
                 self.dist_feat_buffer[:, i + 1:i + 2] = dist_feat[:, -1:, :]
@@ -863,7 +864,7 @@ class WorldModel(nn.Module):
             # action_tensor = torch.cat(action_list, dim=1)
             old_logits_tensor = torch.cat(old_logits_list, dim=1)
             quantizer_output_re, u_re, _ = self.causal_model(self.unmod_dist_feat_buffer[:, :-1], global_step)
-            mod_dist_feat, _ = self.causal_model.state_modulator(self.unmod_dist_feat_buffer[:, :-1],
+            mod_dist_feat, _ = self.state_modulator(self.unmod_dist_feat_buffer[:, :-1],
                                                                  quantizer_output_re['hard_tr'], u_re, global_step)
             reward_hat_tensor, _ = self.reward_decoder(mod_dist_feat, quantizer_output_re['hard_re'],
                                                        quantizer_output_re['q_re'])
@@ -914,9 +915,9 @@ class WorldModel(nn.Module):
                 causal_dist_feat, global_step, training=True)
             # STATE MODULATOR has bidirection gradient flow
             # Allow gradients form modulator to causal model
-            mod_dist_feat, inv_loss = self.causal_model.state_modulator(dist_feat,
-                                                                        quantizer_output['quantized_tr'],
-                                                                        u_post, global_step)
+            mod_dist_feat, inv_loss = self.state_modulator(dist_feat,
+                                                            quantizer_output['quantized_tr'],
+                                                            u_post, global_step)
             # PREDICTION HEADS (with directed gradient flow)
             # For transition prediction - aloow gradients to modulator but not to causal model internals
             prior_logits, total_tr_loss, aux_loss, sparsity_loss = \
@@ -948,8 +949,8 @@ class WorldModel(nn.Module):
                                                                                            :-1].detach())
             # Separate world model losses from causal model losses
             # Added a dynamics loss weight 0.8
-            world_model_loss = reconstruction_loss + reward_loss + termination_loss + dynamics_loss + 0.1 * representation_loss
-            causal_model_loss = causal_loss + pred_loss + re_head_loss
+            world_model_loss = reconstruction_loss + reward_loss + termination_loss + dynamics_loss + 0.1 * representation_loss + pred_loss + re_head_loss
+            causal_model_loss = causal_loss
             # total_loss = reconstruction_loss + reward_loss + termination_loss + dynamics_loss + 0.1 * representation_loss + causal_loss + pred_loss + re_head_loss
 
             # First backward for world model

@@ -130,10 +130,11 @@ class SparseCodebookMoE(nn.Module):
 
 
 class ImportanceWeightedMoE(nn.Module):
-    def __init__(self, num_experts, hidden_state_dim, hidden_dim, code_dim, quantizer, top_k=2, importance_reg=0.01):
+    def __init__(self, num_experts, hidden_state_dim, hidden_dim, code_dim, codebook_data, top_k=2,
+                 importance_reg=0.01):
         super().__init__()
         # Check codebook size first
-        codebook_size = quantizer.tr_quantizer.codebook.data.size(0)
+        codebook_size = codebook_data.size(0)
 
         # Ensure num_experts doesn't exceed codebook size
         safe_num_experts = min(num_experts, codebook_size)
@@ -145,7 +146,7 @@ class ImportanceWeightedMoE(nn.Module):
 
         # Initialize with existing code anchors up to safe_num_experts
         self.register_buffer('code_anchor',
-                             quantizer.tr_quantizer.codebook.data[:safe_num_experts].clone())
+                             codebook_data[:safe_num_experts])
         # Feature importance weights for each expert
         self.feature_importance = nn.Parameter(torch.zeros(num_experts, hidden_state_dim))
         # Initialize with slight randomness to break symmetry
