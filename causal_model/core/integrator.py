@@ -5,8 +5,6 @@ from line_profiler import profile
 from .encoder import CausalEncoder
 from .quantizer import DualVQQuantizer
 from .confounder_approx import ConfounderPosterior, ConfounderPrior
-from .predictors import MoETransitionHead, ImprovedRewardHead, TerminationPredictor, StateModulator
-
 
 class CausalModel(nn.Module):
     def __init__(self, params, device):
@@ -32,7 +30,8 @@ class CausalModel(nn.Module):
         self.causal_encoder = CausalEncoder(hidden_state_dim=self.hidden_state_dim,
                                             tr_proj_dim=self.encoder_params.TransProjDim,
                                             re_proj_dim=self.encoder_params.RewProjDim,
-                                            hidden_dim=self.encoder_params.HiddenDim)
+                                            hidden_dim=self.encoder_params.HiddenDim,
+                                            embedding_mode=self.encoder_params.Embedding)
 
         """
         QUANTIZER
@@ -96,44 +95,6 @@ class CausalModel(nn.Module):
                                                        num_codes=self.num_codes_tr,
                                                        hidden_dim=self.confounder_params.HiddenDim)
 
-        """
-        PREDICTOR HEADS
-            Transition Head: aux_loss (SparseCodebookMoE), Sparsity Loss
-            Loss weights: aux_loss, Sparsity_loss
-        """
-        self.predictor_params = params.Models.CausalModel.Predictors
-        self.loss_weights.update({
-            'tr_aux_loss': self.predictor_params.Transition.AuxiliaryWeight,
-            'tr_sparsity_weight': self.predictor_params.Transition.MaskSparsityWeight
-        })
-        self.state_modulator = StateModulator(self.hidden_state_dim, self.predictor_params.Transition.HiddenDim,
-                                              self.code_dim_tr, self.confounder_params.ConfDim,
-                                              self.predictor_params.ComputeInvarianceLoss)
-
-        self.tr_head = MoETransitionHead(hidden_state_dim=self.hidden_state_dim,
-                                         hidden_dim=self.predictor_params.Transition.HiddenDim,
-                                         code_dim=self.code_dim_tr,
-                                         conf_dim=self.confounder_params.ConfDim,
-                                         num_experts=self.predictor_params.Transition.NumOfExperts,
-                                         top_k=self.predictor_params.Transition.TopK,
-                                         state_modulator=self.state_modulator,
-                                         quantizer=self.quantizer,
-                                         use_importance_weighted_moe=self.predictor_params.Transition.UseImportanceWeightedMoE
-                                         )
-
-        self.re_head = ImprovedRewardHead(num_codes=self.num_codes_re,
-                                          code_dim=self.code_dim_re,
-                                          hidden_dim=self.predictor_params.Reward.HiddenDim,
-                                          hidden_state_dim=self.hidden_state_dim,
-                                          )
-
-        self.terminator = TerminationPredictor(hidden_state_dim=self.hidden_state_dim,
-                                               hidden_units=self.predictor_params.Termination.HiddenDim,
-                                               act=self.predictor_params.Termination.Activation,
-                                               layer_num=self.predictor_params.Termination.NumLayers,
-                                               dropout=self.predictor_params.Termination.Dropout,
-                                               dtype=params.Models.WorldModel.dtype,
-                                               device=self.device)
 
     @profile
     def forward(self, h, global_step, training=False):

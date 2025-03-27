@@ -175,7 +175,7 @@ class MoETransitionHead(nn.Module):
         code_emb_stable = code_emb.detach()  # .detach()
 
         # print("weighted_h shape nsitionHead:", h_modulated.shape)
-        # print("code_emb shape in MoETransiin MoETrationHead:", code_emb_stable.shape)
+        # print("code_emb shape in MoETransitionHead:", code_emb_stable.shape)
         # Process through MoE
         moe_out, aux_loss, importance_stats = self.moe(h_modulated, code_emb_stable)
         moe_out = torch.clamp(moe_out, -100, 100)  # Add reasonable bounds

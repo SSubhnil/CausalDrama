@@ -45,7 +45,7 @@ JointTrainAgent:
   TrainAgentEverySteps: 1
   FreezeWorldModelAfterSteps: 100000
   FreezeBehaviourAfterSteps: 100000
-  SaveEverySteps: 1500
+  SaveEverySteps: 2000
   SaveModels: True
   Tau: 10
   ImaginationTau: 10
@@ -116,6 +116,7 @@ Models:
     UseConfounder: False      # Flag to use confounder encoder and approximator
 
     Encoder:                  # Avoid bottlenecking -> hidden_dim == hidden_state_dim
+      Embedding: projection   # projection / continuous/ discrete(WIP)
       TransProjDim: 256       # Dim of projection of h into transition continuous embeddings
       RewProjDim: 128         # Dim of projection of h into reward continuous embeddings
       HiddenDim: 512          # Hidden layer dimensions
@@ -131,13 +132,13 @@ Models:
       BetaTransition: 0.25              # Commitment loss weight for transitions
       BetaReward: 0.25                  # Commitment loss weight for rewards
       NormalizedInputs: True  # L2 normalize inputs/codebook
-      Coupling: False          # Enable codebook coupling
+      Coupling: True          # Enable codebook coupling
       SparsityWeight: 0.1     # Sparsity Loss for coupling
       LambdaCouple: 0.1       # Coupling loss weight
       UseCDist: False
 
     Confounder:
-      ConfDim: 128            # Confounder Dimensions
+      ConfDim: 128            # Confounder Dimensions - same as NumCodesTr
       HiddenDim: 512          # Hidden layer dimensions
       PriorLayers: 2          # MLP layers for prior network
       PostLayers: 2           # MLP layers for posterior
@@ -187,7 +188,7 @@ Models:
 
   Agent:
     dtype: float32
-    Policy: PPO # AC or PPO
+    Policy: AC # AC or PPO
     Unimix_ratio: 0
     AC:
       NumLayers: 3

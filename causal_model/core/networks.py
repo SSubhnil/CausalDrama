@@ -147,7 +147,7 @@ class ImportanceWeightedMoE(nn.Module):
         self.register_buffer('code_anchor',
                              quantizer.tr_quantizer.codebook.data[:safe_num_experts].clone())
         # Feature importance weights for each expert
-        self.feature_importance = nn.Parameter(torch.zeros(num_experts, hidden_dim))
+        self.feature_importance = nn.Parameter(torch.zeros(num_experts, hidden_state_dim))
         # Initialize with slight randomness to break symmetry
         nn.init.normal_(self.feature_importance, mean=0.0, std=0.01)
 
@@ -222,70 +222,52 @@ class ImportanceWeightedMoE(nn.Module):
         # 5. Initialize output tensor
         batch_size = h.shape[0]
         seq_len = h.shape[1] if is_3d else 1
-        full_output = torch.zeros(batch_size, seq_len, 1024, device=h.device)
 
         # 6. Process through ALL experts with importance weighting
-        importance_entropies = []
         temperature = torch.clamp(self.importance_temperature, min=0.1, max=5.0)
 
-        for i, expert in enumerate(self.experts):
-            if i >= self.num_experts:
-                continue
+        # Compute importance for all experts at once
+        importance = F.softmax(self.feature_importance / temperature, dim=1)  # [num_experts, hidden_dim]
 
-            # Apply feature importance weighting
-            importance = F.softmax(self.feature_importance[i] / temperature, dim=0)
-            if is_3d:
-                # Ensure feature dimensions match before reshaping
-                if importance.shape[0] != h.shape[2]:
-                    importance = F.pad(importance, (0, h.shape[2] - importance.shape[0]))[:h.shape[2]]
-                importance = importance.view(1, 1, -1)
-            else:
-                if importance.shape[0] != h.shape[1]:
-                    importance = F.pad(importance, (0, h.shape[1] - importance.shape[0]))[:h.shape[1]]
-                importance = importance.view(1, -1)
+        if is_3d:
+            importance = importance.unsqueeze(1).unsqueeze(0)  # [1, num_experts, 1, hidden_dim]
+            h = h.unsqueeze(1)  # [batch_size, 1, seq_len, hidden_dim]
+        else:
+            importance = importance.unsqueeze(0)  # [1, num_experts, hidden_dim]
+            h = h.unsqueeze(1)  # [batch_size, 1, hidden_dim]
 
-            # CRITICAL FIX: Ensure importance has proper shape for broadcasting
-            if h.dim() == 3:  # [B, T, D]
-                importance = importance.view(1, 1, -1)
-            else:  # [B, D]
-                importance = importance.view(1, -1)
-            weighted_h = h * importance
+        # Apply importance weighting to all experts simultaneously
+        weighted_h = h * importance  # [batch_size, num_experts, seq_len, hidden_dim] or [batch_size, num_experts, hidden_dim]
 
-            # Track entropy for regularization
-            importance_entropy = -(importance.flatten() * torch.log(importance.flatten() + 1e-8)).sum()
-            importance_entropies.append(importance_entropy.item())
+        # Prepare inputs for all experts
+        expert_inputs = torch.cat([weighted_h, code_emb.unsqueeze(1).expand(-1, self.num_experts, -1, -1)], dim=-1)
 
-            # Process input through expert
-            expert_input = torch.cat([weighted_h, code_emb], dim=-1)
-            output = expert(expert_input)
+        # Process through all experts simultaneously
+        expert_outputs = torch.stack([expert(expert_inputs[:, i]) for i, expert in enumerate(self.experts)], dim=1)
 
-            # Add weighted contribution to result (using DIRECT expert weights)
-            slice_size = 1024 // self.num_experts
+        # Combine expert outputs
+        slice_size = 1024 // self.num_experts
+        full_output = torch.zeros(batch_size, seq_len, 1024, device=h.device)
+        for i in range(self.num_experts):
             start_idx = i * slice_size
             end_idx = (i + 1) * slice_size
-
-            # Extract this expert's weight directly from the full distribution
-            expert_weight = expert_weights[..., i:i + 1]
-
-            # Add weighted output
-            full_output[..., start_idx:end_idx] += output[..., :slice_size] * expert_weight
+            full_output[..., start_idx:end_idx] = expert_outputs[:, i, ..., :slice_size] * expert_weights[..., i:i + 1]
 
         # 7. Calculate auxiliary losses
         expert_counts = expert_weights.sum(0)
         expert_load = expert_counts / (expert_counts.sum() + 1e-8)
-
-        # Modified routing loss for balance - encourage more uniform usage
         routing_loss = 0.5 * (expert_counts.std() + (-expert_load * torch.log(expert_load + 1e-8)).sum())
 
-        # Calculate average importance entropy
-        avg_entropy = sum(importance_entropies) / max(len(importance_entropies), 1)
+        # Calculate importance entropies
+        importance_entropies = -(importance * torch.log(importance + 1e-8)).sum(dim=-1).mean(dim=0)
+        avg_entropy = importance_entropies.mean()
         aux_loss = routing_loss - self.importance_reg * avg_entropy
 
         # Create stats dictionary
         importance_stats = {
-            'entropy': importance_entropies,
-            'mean': [0.0] * len(importance_entropies),
-            'std': [0.0] * len(importance_entropies)
+            'entropy': importance_entropies.tolist(),
+            'mean': importance.mean(dim=-1).squeeze().tolist(),
+            'std': importance.std(dim=-1).squeeze().tolist()
         }
 
         return full_output, aux_loss, importance_stats

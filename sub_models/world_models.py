@@ -19,6 +19,7 @@ from sub_models.transformer_model import StochasticTransformerKVCache
 from mamba_ssm import MambaWrapperModel, MambaConfig, InferenceParams, update_graph_cache
 
 from causal_model.core.integrator import CausalModel
+from causal_model.core.predictors import MoETransitionHead, ImprovedRewardHead, TerminationPredictor, StateModulator
 import agents
 from line_profiler import profile
 from torch.distributions.independent import Independent
@@ -339,6 +340,15 @@ class WorldModel(nn.Module):
                              config.JointTrainAgent.ImagineContextLength + config.JointTrainAgent.ImagineBatchLength,
                              config.JointTrainAgent.RealityContextLength)
 
+        # For new predictor heads
+        self.code_dim_tr = config.Models.CausalModel.TrCodeDim
+        self.code_dim_re = config.Models.CausalModel.ReCodeDim
+        self.num_codes_tr = config.Models.CausalModel.NumCodesTr
+        self.num_codes_re = config.Models.CausalModel.NumCodesRe
+        self.hidden_dim = config.Models.CausalModel.HiddenDim
+        self.use_confounder = config.Models.CausalModel.UseConfounder
+        self.confounder_params = config.Models.CausalModel.Confounder
+
         # Image encoder
         self.encoder = Encoder(
             depth=config.Models.WorldModel.Encoder.Depth,
@@ -395,13 +405,52 @@ class WorldModel(nn.Module):
             device=self.device
         )
 
+        """
+        PREDICTOR HEADS
+            Transition Head: aux_loss (SparseCodebookMoE), Sparsity Loss
+            Loss weights: aux_loss, Sparsity_loss
+        """
+        self.predictor_params = config.Models.CausalModel.Predictors
+        self.loss_weights.update({
+            'tr_aux_loss': self.predictor_params.Transition.AuxiliaryWeight,
+            'tr_sparsity_weight': self.predictor_params.Transition.MaskSparsityWeight
+        })
+        self.state_modulator = StateModulator(self.hidden_state_dim, self.predictor_params.Transition.HiddenDim,
+                                              self.code_dim_tr, self.confounder_params.ConfDim,
+                                              self.predictor_params.ComputeInvarianceLoss)
+
+        self.tr_head = MoETransitionHead(hidden_state_dim=self.hidden_state_dim,
+                                         hidden_dim=self.predictor_params.Transition.HiddenDim,
+                                         code_dim=self.code_dim_tr,
+                                         conf_dim=self.confounder_params.ConfDim,
+                                         num_experts=self.predictor_params.Transition.NumOfExperts,
+                                         top_k=self.predictor_params.Transition.TopK,
+                                         state_modulator=self.state_modulator,
+                                         quantizer=self.quantizer,
+                                         use_importance_weighted_moe=self.predictor_params.Transition.UseImportanceWeightedMoE
+                                         )
+
+        self.re_head = ImprovedRewardHead(num_codes=self.num_codes_re,
+                                          code_dim=self.code_dim_re,
+                                          hidden_dim=self.predictor_params.Reward.HiddenDim,
+                                          hidden_state_dim=self.hidden_state_dim,
+                                          )
+
+        self.terminator = TerminationPredictor(hidden_state_dim=self.hidden_state_dim,
+                                               hidden_units=self.predictor_params.Termination.HiddenDim,
+                                               act=self.predictor_params.Termination.Activation,
+                                               layer_num=self.predictor_params.Termination.NumLayers,
+                                               dropout=self.predictor_params.Termination.Dropout,
+                                               dtype=config.Models.WorldModel.dtype,
+                                               device=self.device)
+
         self.dist_head = DistHead(
             image_feat_dim=self.encoder.output_flatten_dim,
             hidden_state_dim=self.hidden_state_dim,
             categorical_dim=self.categorical_dim,
             class_dim=self.class_dim,
             unimix_ratio=config.Models.WorldModel.Unimix_ratio,
-            tr_predictor=self.causal_model.tr_head,
+            tr_predictor=self.tr_head,
             dtype=config.Models.WorldModel.dtype, device=device
         )
         self.image_decoder = Decoder(
@@ -419,8 +468,8 @@ class WorldModel(nn.Module):
             dtype=config.Models.WorldModel.dtype, device=device
         )
 
-        self.reward_decoder = self.causal_model.re_head
-        self.termination_decoder = self.causal_model.terminator
+        self.reward_decoder = self.re_head
+        self.termination_decoder = self.terminator
         # self.reward_decoder = RewardHead(
         #     num_classes=255,
         #     inp_dim=self.hidden_state_dim,
