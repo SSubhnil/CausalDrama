@@ -92,8 +92,8 @@ class VQQuantizer(nn.Module):
                 # diff = h_flat_norm - c_tilde_flat
                 # codebook_loss = (diff.detach() ** 2).mean()
                 # commitment_loss = (diff ** 2).mean()
-                codebook_loss = F.mse_loss(c_hard_flat, h_flat_norm.detach())
-                commitment_loss = F.mse_loss(h_flat_norm, c_hard_flat.detach())
+                codebook_loss = F.mse_loss(c_tilde_flat, h_flat_norm.detach())
+                commitment_loss = F.mse_loss(h_flat_norm, c_tilde_flat.detach())
                 loss = codebook_loss + self.beta * commitment_loss
 
                 # Straight-through estimator for training
