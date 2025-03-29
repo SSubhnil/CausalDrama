@@ -69,7 +69,8 @@ def train_world_model_step(replay_buffer: ReplayBuffer, world_model: WorldModel,
     epoch_representation_loss_list = []
     epoch_representation_real_kl_div_list = []
     epoch_quant_loss_list = []
-    epoch_confounder_loss_list = []
+    epoch_post_loss_list = []
+    epoch_prior_loss_list = []
     epoch_causal_loss_list = []
     epoch_world_loss_list = []
 
@@ -77,7 +78,7 @@ def train_world_model_step(replay_buffer: ReplayBuffer, world_model: WorldModel,
         obs, action, reward, termination = replay_buffer.sample(batch_size, batch_length, imagine=False)
         reconstruction_loss, reward_loss, termination_loss, \
             dynamics_loss, dynamics_real_kl_div, representation_loss, \
-            representation_real_kl_div, quant_loss, confounder_loss, causal_model_loss, world_model_loss = world_model.update(
+            representation_real_kl_div, quant_loss, post_loss, prior_loss, causal_model_loss, world_model_loss = world_model.update(
             obs, action, reward, termination,
             global_step=global_step, epoch_step=e,
             logger=logger)
@@ -90,7 +91,8 @@ def train_world_model_step(replay_buffer: ReplayBuffer, world_model: WorldModel,
         epoch_representation_loss_list.append(representation_loss)
         epoch_representation_real_kl_div_list.append(representation_real_kl_div)
         epoch_quant_loss_list.append(quant_loss)
-        epoch_confounder_loss_list.append(confounder_loss)
+        epoch_prior_loss_list.append(prior_loss)
+        epoch_post_loss_list.append(post_loss)
         epoch_causal_loss_list.append(causal_model_loss)
         epoch_world_loss_list.append(world_model_loss)
     if logger is not None:
@@ -104,7 +106,8 @@ def train_world_model_step(replay_buffer: ReplayBuffer, world_model: WorldModel,
         logger.log("WorldModel/representation_real_kl_div", np.mean(epoch_representation_real_kl_div_list),
                    global_step=global_step)
         logger.log("WorldModel/quant_loss", np.mean(epoch_quant_loss_list), global_step=global_step)
-        logger.log("WorldModel/confounder_loss", np.mean(epoch_confounder_loss_list), global_step=global_step)
+        logger.log("WorldModel/prior_loss", np.mean(epoch_prior_loss_list), global_step=global_step)
+        logger.log("WorldModel/posterior_loss", np.mean(epoch_post_loss_list), global_step=global_step)
         logger.log("WorldModel/causal_model_loss", np.mean(epoch_causal_loss_list), global_step=global_step)
         logger.log("WorldModel/world_model_loss", np.mean(epoch_world_loss_list), global_step=global_step)
 

@@ -908,11 +908,9 @@ class WorldModel(nn.Module):
             else:
                 dist_feat = self.sequence_model(flattened_sample, action)
 
-            causal_dist_feat = dist_feat.detach()  # Detach to stop world model training
-
             # 1. Pass the dist_feat to the causal model encoder -> quantizer -> confounding
             quantizer_output, u_post, causal_loss, quant_loss, prior_loss, post_loss = self.causal_model(
-                causal_dist_feat, global_step, training=True)
+                dist_feat.detach(), global_step, training=True)
             # STATE MODULATOR has bidirection gradient flow
             # Allow gradients form modulator to causal model
             mod_dist_feat, inv_loss = self.state_modulator(dist_feat,
@@ -922,12 +920,12 @@ class WorldModel(nn.Module):
             # For transition prediction - aloow gradients to modulator but not to causal model internals
             prior_logits, total_tr_loss, aux_loss, sparsity_loss = \
                 self.dist_head.forward_prior(mod_dist_feat,
-                                             quantizer_output['quantized_tr'].detach(),  # Detach codes
-                                             u_post.detach())  # Detach posterior
+                                             quantizer_output['quantized_tr'],  # Detach codes
+                                             u_post)  # Detach posterior
             # decoding reward and termination with dist_feat
             reward_hat, re_head_loss = self.reward_decoder(mod_dist_feat,
-                                                           quantizer_output['quantized_re'].detach(),
-                                                           quantizer_output['q_re'].detach())
+                                                           quantizer_output['quantized_re'],
+                                                           quantizer_output['q_re'])
             pred_loss = 0.1 * inv_loss + 0.01 * aux_loss + 0.05 * sparsity_loss
 
             # Common loss calculations

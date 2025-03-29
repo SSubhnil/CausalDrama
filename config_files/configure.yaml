@@ -25,7 +25,7 @@ Separate: # Alternate training of the Causal model and world model
   AlternationFrequency: 1  # Switch phase every 4 steps (1=every step)
   PhaseMultiplier: 2       # Train the active component twice
   SeparateOptimizers: True
-  CausalModelLR: 5.0e-5      # Separate learning rate for causal model
+  CausalModelLR: 4.0e-5      # Separate learning rate for causal model
   CausalOptimizer: Adam # Adam or Laprop
 
 JointTrainAgent:
@@ -61,7 +61,7 @@ Models:
     Act: SiLU
     CategoricalDim: 32
     ClassDim: 32
-    HiddenStateDim: 1024
+    HiddenStateDim: 512
     Optimiser: Laprop
     LatentDiscreteType: naive
     Max_grad_norm: 1000
@@ -116,7 +116,7 @@ Models:
     UseConfounder: False      # Flag to use confounder encoder and approximator
 
     Encoder:                  # Avoid bottlenecking -> hidden_dim == hidden_state_dim
-      Embedding: projection   # projection / continuous/ discrete(WIP)
+      Embedding: continuous   # projection / continuous/ discrete(WIP)
       TransProjDim: 256       # Dim of projection of h into transition continuous embeddings
       RewProjDim: 128         # Dim of projection of h into reward continuous embeddings
       HiddenDim: 512          # Hidden layer dimensions
@@ -132,12 +132,13 @@ Models:
       BetaTransition: 0.25              # Commitment loss weight for transitions
       BetaReward: 0.25                  # Commitment loss weight for rewards
       NormalizedInputs: True  # L2 normalize inputs/codebook
-      Coupling: True          # Enable codebook coupling
+      Coupling: False          # Enable codebook coupling
       SparsityWeight: 0.1     # Sparsity Loss for coupling
       LambdaCouple: 0.1       # Coupling loss weight
       UseCDist: False
 
     Confounder:
+      UseMixturePrior: False   # Mixture of priors over codes
       ConfDim: 128            # Confounder Dimensions - same as NumCodesTr
       HiddenDim: 512          # Hidden layer dimensions
       PriorLayers: 2          # MLP layers for prior network
@@ -188,7 +189,7 @@ Models:
 
   Agent:
     dtype: float32
-    Policy: AC # AC or PPO
+    Policy: PPO # AC or PPO
     Unimix_ratio: 0
     AC:
       NumLayers: 3
