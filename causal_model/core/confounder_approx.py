@@ -240,6 +240,28 @@ class ConfounderPosterior(nn.Module):
         std = torch.exp(0.5 * logvar).clamp_min(self._eps)
         return mu + std * torch.randn_like(std)
 
+    def gaussian_KL_to_mixture(self, mu_post, logvar_post, mix_weights, prior_mus, prior_logvars):
+        """KL divergence from Gaussian posterior to Gaussian mixture prior"""
+        var_post = torch.exp(logvar_post)
+
+        # Expand posterior parameters to compare with each mixture component
+        # [B, T, 1, D] x [B, T, K, D] -> [B, T, K, D]
+        mu_post_exp = mu_post.unsqueeze(2).expand_as(prior_mus)
+        var_post_exp = var_post.unsqueeze(2).expand_as(prior_mus)
+        logvar_post_exp = logvar_post.unsqueeze(2).expand_as(prior_mus)
+
+        # Compute KL for each component: KL(q||p_i)
+        var_prior = torch.exp(prior_logvars)
+        kl_per_component = 0.5 * (
+                prior_logvars - logvar_post_exp +
+                (var_post_exp + (mu_post_exp - prior_mus) ** 2) / var_prior - 1
+        ).sum(dim=-1)  # [B, T, K]
+
+        # Use variational upper bound: KL(q||mix) <= Σ_i π_i KL(q||p_i)
+        weighted_kl = (mix_weights * kl_per_component).sum(dim=-1)  # [B, T]
+
+        return weighted_kl.mean()
+
 
 # Initialized for confounder prior
 class ConfounderPrior(nn.Module):
@@ -303,8 +325,173 @@ class ConfounderPrior(nn.Module):
 
     def prior_regularization(self, mu):
         """Kinetic energy constraint"""
+        # energy = torch.norm(mu, dim=1).mean()
+        # return torch.relu(energy - 3.0)  # [1][3]
+        target_energy = 3.0
         energy = torch.norm(mu, dim=1).mean()
-        return torch.relu(energy - 3.0)  # [1][3]
+        return (energy - target_energy) ** 2  # Quadratic penalty
+
+    def add_new_code(self, prototype_emb):
+        """Initialization via next existing code"""
+        with torch.no_grad():
+            sim = F.cosine_similarity(prototype_emb, self.code_emb.weight)
+            new_emb = 0.5 * (self.code_emb.weight[sim.argmax()] + prototype_emb)
+            self.code_emb.weight.data[-1] = new_emb
+
+    # Slightly better than before
+    def add_new_code_2(self, prototype_emb, prior_std=0.1):
+        with torch.no_grad():
+            # Sample perturbed prototypes
+            proto_noise = prior_std * torch.randn_like(prototype_emb)
+            perturbed_proto = prototype_emb + proto_noise
+
+            # Find nearest in noise-robust space
+            sim = F.cosine_similarity(perturbed_proto, self.code_emb.weight)
+            new_emb = 0.7 * self.code_emb.weight[sim.argmax()] + 0.3 * perturbed_proto
+
+    def code_alignment_loss(self):
+        """Tries to match momentum vs actual embeddings"""
+        return F.mse_loss(self.code_emb_momentum, self.code_embed.weight.detach())
+
+
+class MixtureConfounderPrior(nn.Module):
+    def __init__(self, num_codes, code_dim, conf_dim, hidden_state_proj_dim, momentum=0.90):
+        super().__init__()
+        self.code_embed = nn.Embedding(num_codes, code_dim)
+        self.register_buffer('code_emb_momentum', torch.empty_like(self.code_embed.weight))
+        nn.init.orthogonal_(self.code_emb_momentum)
+        self.momentum = momentum
+        self.h_proj_dim = hidden_state_proj_dim
+        self.num_codes = num_codes
+        self.conf_dim = conf_dim
+
+        # Parameter networks (same as before)
+        self.mu_net = nn.Sequential(
+            nn.Linear(self.h_proj_dim + code_dim, conf_dim),
+            nn.LayerNorm(conf_dim),
+            nn.Linear(conf_dim, conf_dim),
+            nn.Tanh()
+        )
+
+        self.logvar_net = nn.Sequential(
+            nn.Linear(self.h_proj_dim + code_dim, conf_dim),
+            nn.Hardtanh(min_val=math.log(0.1), max_val=math.log(2.0))
+        )
+
+        # NEW: Mixture weight network
+        self.mix_weight_net = nn.Sequential(
+            nn.Linear(self.h_proj_dim, 256),
+            nn.SiLU(),
+            nn.Linear(256, num_codes)
+        )
+
+        self.register_buffer('mu_bounds', torch.tensor([-3.0, 3.0]))
+
+    def forward(self, h: torch.Tensor, code_ids: torch.Tensor = None):
+        """Returns mixture parameters for p(u|h)"""
+        # Handle dimensionality
+        h_shape = h.shape
+        if len(h_shape) == 3:  # [B, T, D]
+            is_3d = True
+            B, T, D = h_shape
+        else:  # [B, D]
+            is_3d = False
+            B, D = h_shape
+            h = h.unsqueeze(1)  # Add a time dimension for consistent processing
+
+        # Update momentum codebook (selectively if code_ids provided)
+        with torch.no_grad():
+            # if code_ids is not None and self.training:
+            #     # Update only for codes that were used (like original implementation)
+            #     unique_indices = torch.unique(code_ids)
+            #     self.code_emb_momentum[unique_indices] = (
+            #         self.momentum * self.code_emb_momentum[unique_indices] +
+            #         (1 - self.momentum) * self.code_embed.weight[unique_indices].detach()
+            #     )
+            # else:
+            # Full update (can be inefficient with large codebooks)
+            self.code_emb_momentum = (self.momentum * self.code_emb_momentum +
+                                      (1 - self.momentum) * self.code_embed.weight.detach())
+
+        with (torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=True)):
+            # Compute mixture weights: π(c_i^Tr|h)
+            mix_logits = self.mix_weight_net(h)  # [B, T, num_codes]
+            mix_weights = F.softmax(mix_logits, dim=-1)
+
+            # Expand h to combine with each code
+            h_expanded = h.unsqueeze(2).expand(-1, -1, self.num_codes, -1)  # [B, T, K, D]
+
+            # Get all code embeddings
+            all_codes = self.code_emb_momentum.unsqueeze(0).unsqueeze(0).expand(
+                B, h.shape[1], -1, -1)  # [B, T, K, code_dim]
+
+            # Combine h with each code embedding
+            combined = torch.cat([h_expanded, all_codes], dim=-1)  # [B, T, K, D+code_dim]
+
+            # Reshape for batch processing through networks
+            flat_combined = combined.view(-1, combined.shape[-1])
+
+            # Generate parameters for all components
+            flat_mu = self.mu_net(flat_combined).clamp(*self.mu_bounds)
+            flat_logvar = self.logvar_net(flat_combined)
+
+            # Reshape back to original dimensionality
+            mus = flat_mu.view(B, h.shape[1], self.num_codes, self.conf_dim)
+            logvars = flat_logvar.view(B, h.shape[1], self.num_codes, self.conf_dim)
+
+            # Restore original dimensions if input was 2D
+            if not is_3d:
+                mix_weights = mix_weights.squeeze(1)  # [B, num_codes]
+                mus = mus.squeeze(1)  # [B, num_codes, conf_dim]
+                logvars = logvars.squeeze(1)  # [B, num_codes, conf_dim]
+
+            return mix_weights, mus, logvars
+
+    def sample(self, h, code_ids=None):
+        """Sample from the mixture distribution"""
+        # Shape handling happens in forward
+        mix_weights, mus, logvars = self.forward(h, code_ids)
+
+        # Handle dimensionality for sampling
+        is_3d = len(h.shape) == 3
+        if is_3d:
+            B, T = h.shape[0], h.shape[1]
+        else:
+            B = h.shape[0]
+            T = 1
+            mix_weights = mix_weights.unsqueeze(1)
+            mus = mus.unsqueeze(1)
+            logvars = logvars.unsqueeze(1)
+
+        # Sample component indices based on mixture weights
+        component_dist = torch.distributions.Categorical(probs=mix_weights)
+        component_indices = component_dist.sample()  # [B, T]
+
+        # Gather selected means and logvars
+        batch_indices = torch.arange(B, device=h.device).view(-1, 1).expand(-1, T)
+        seq_indices = torch.arange(T, device=h.device).view(1, -1).expand(B, -1)
+
+        selected_mu = mus[batch_indices, seq_indices, component_indices]
+        selected_logvar = logvars[batch_indices, seq_indices, component_indices]
+
+        # Sample from the selected Gaussian
+        std = torch.exp(0.5 * selected_logvar)
+        eps = torch.randn_like(std)
+        samples = selected_mu + eps * std
+
+        # Restore original dimensions
+        if not is_3d:
+            samples = samples.squeeze(1)
+
+        return samples
+
+    def prior_regularization(self, mu):
+        """Kinetic energy constraint"""
+        # energy = torch.norm(mu, dim=1).mean()
+        # return torch.relu(energy - 3.0)  # [1][3]
+        target_energy = 3.0
+        energy = torch.norm(mu, dim=1).mean()
+        return (energy - target_energy) ** 2  # Quadratic penalty
 
     def add_new_code(self, prototype_emb):
         """Initialization via next existing code"""
