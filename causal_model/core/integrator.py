@@ -4,7 +4,8 @@ import time
 from line_profiler import profile
 from .encoder import CausalEncoder
 from .quantizer import DualVQQuantizer
-from .confounder_approx import ConfounderPosterior, ConfounderPrior
+from .confounder_approx import ConfounderPosterior, ConfounderPrior, MixtureConfounderPrior
+
 
 class CausalModel(nn.Module):
     def __init__(self, params, device):
@@ -78,6 +79,7 @@ class CausalModel(nn.Module):
         """
 
         self.confounder_params = params.Models.CausalModel.Confounder
+        self.use_mixture_prior = self.confounder_params.UseMixturePrior
         self.loss_weights.update({
             'prior_reg_weight': self.confounder_params.PriorRegWeight,
             'prior_code_align': self.confounder_params.PriorCodeAlign,
@@ -85,50 +87,65 @@ class CausalModel(nn.Module):
             'post_sparsity': self.confounder_params.PostCodeSparsity,
             'kl_loss_weight': self.confounder_params.PostKLWeight
         })
-        self.confounder_prior_net = ConfounderPrior(num_codes=self.num_codes_tr,
-                                                    code_dim=self.code_dim_tr,
-                                                    conf_dim=self.confounder_params.ConfDim,
-                                                    hidden_state_proj_dim=self.encoder_params.TransProjDim,
-                                                    momentum=self.confounder_params.PriorMomentum)
+        if not self.use_mixture_prior:
+            self.confounder_prior_net = ConfounderPrior(num_codes=self.num_codes_tr,
+                                                        code_dim=self.code_dim_tr,
+                                                        conf_dim=self.confounder_params.ConfDim,
+                                                        hidden_state_proj_dim=self.encoder_params.TransProjDim,
+                                                        momentum=self.confounder_params.PriorMomentum)
+        else:
+            self.confounder_prior_net = MixtureConfounderPrior(num_codes=self.num_codes_tr,
+                                                               code_dim=self.code_dim_tr,
+                                                               conf_dim=self.confounder_params.ConfDim,
+                                                               hidden_state_proj_dim=self.encoder_params.TransProjDim,
+                                                               momentum=self.confounder_params.PriorMomentum)
+
         self.confounder_post_net = ConfounderPosterior(code_dim=self.code_dim_tr,
                                                        conf_dim=self.confounder_params.ConfDim,
                                                        num_codes=self.num_codes_tr,
                                                        hidden_dim=self.confounder_params.HiddenDim)
 
-
     @profile
     def forward(self, h, global_step, training=False):
 
-        # Common operations needed for both paths
-        if global_step < 1033:
-            h_stable = h.detach()
-        else:
-            h_stable = h
-
         # Projection of raw hidden state into h_tr and h_re
-        h_proj_tr, h_proj_re = self.causal_encoder(h_stable)
+        h_proj_tr, h_proj_re = self.causal_encoder(h)
 
         # Different paths for training and inference
         if training:
+            self.anneal_quantizer_temperature(global_step)
+
             # Full training path with all losses
             quant_output_dict = self.quantizer(h_proj_tr, h_proj_re, training=True)
             code_emb_tr = quant_output_dict['quantized_tr']
             quant_loss = quant_output_dict['loss']
 
-            mu_prior, logvar_prior = self.confounder_prior_net(h_proj_tr,
-                                                               code_ids=quant_output_dict['hard_tr'].argmax(-1))
-            # Confounder posterior with KL loss
-            u_post, mu_post, logvar_post = self.confounder_post_net(h_proj_tr, code_emb_tr)
+            if not self.use_mixture_prior:
+                mu_prior, logvar_prior = self.confounder_prior_net(h_proj_tr,
+                                                                   code_ids=quant_output_dict['hard_tr'].argmax(-1))
+            else:
+                mix_weights, mu_prior, logvar_prior = self.confounder_prior_net(h_proj_tr,
+                                                                                code_ids=quant_output_dict[
+                                                                                    'hard_tr'].argmax(
+                                                                                    -1) if 'hard_tr' in quant_output_dict else None)
 
+            # Prior losses
             prior_code_alignment_loss = self.confounder_prior_net.code_alignment_loss() * self.loss_weights[
                 'prior_code_align']
             prior_reg_loss = self.confounder_prior_net.prior_regularization(mu_prior) * self.loss_weights[
                 'prior_reg_weight']
             prior_loss = prior_code_alignment_loss + prior_reg_loss
 
-            # Posterior losses - detach prior parameters
-            kl_loss = self.confounder_post_net.gaussian_KL(mu_post, logvar_post, mu_prior.detach(),
-                                                           logvar_prior.detach())
+            # Confounder posterior
+            u_post, mu_post, logvar_post = self.confounder_post_net(h_proj_tr, code_emb_tr)
+
+            # Posterior losses - (optional) detach prior parameters
+            if not self.use_mixture_prior:
+                kl_loss = self.confounder_post_net.gaussian_KL(mu_post, logvar_post, mu_prior, logvar_prior)
+            else:
+                kl_loss = self.confounder_post_net.gaussian_KL_to_mixture(mu_post, logvar_post,
+                                                                          mix_weights, mu_prior, logvar_prior)
+
             # Regularization losses
             post_l2_reg, post_sparsity = self.confounder_post_net.regularization_loss()
             post_l2_reg = post_l2_reg * self.loss_weights['post_reg']
@@ -146,9 +163,13 @@ class CausalModel(nn.Module):
             code_emb_tr = quant_output_dict['quantized_tr']
 
             # Only calculate what's needed for inference
-            mu_prior, logvar_prior = self.confounder_prior_net(h_proj_tr.detach(),
-                                                               code_ids=quant_output_dict['hard_tr'].argmax(-1))
-
+            if not self.use_mixture_prior:
+                mu_prior, logvar_prior = self.confounder_prior_net(h_proj_tr.detach(),
+                                                                   code_ids=quant_output_dict['hard_tr'].argmax(-1))
+            else:
+                _, mu_prior, logvar_prior = self.confounder_prior_net(h_proj_tr.detach(),
+                                                                      code_ids=quant_output_dict['hard_tr'].argmax(
+                                                                          -1) if 'hard_tr' in quant_output_dict else None)
             # Skip KL and regularization loss calculations
             u_post = self._inference_posterior(h_proj_tr, code_emb_tr, mu_prior, logvar_prior)
 
@@ -163,3 +184,21 @@ class CausalModel(nn.Module):
 
             # Reparameterize
             return self.confounder_post_net.reparameterize(mu_post, logvar_post)
+
+    def anneal_quantizer_temperature(self, global_step):
+        """Anneals quantizer temperature based on training progress"""
+        # Early warmup phase
+        if global_step < 2000:
+            return  # Keep initial temperatures
+
+        # Main annealing phase - determine progress factor
+        if global_step < 40000:
+            # Early training: slow annealing
+            effective_epoch = (global_step - 2000) / 8000
+        else:
+            # Later training: faster annealing
+            effective_epoch = (global_step - 2000) / 4000
+
+        # Apply temperature annealing
+        self.quantizer.anneal_temperature(effective_epoch)
+
