@@ -130,7 +130,7 @@ class SparseCodebookMoE(nn.Module):
 
 
 class ImportanceWeightedMoE(nn.Module):
-    def __init__(self, num_experts, hidden_state_dim, hidden_dim, code_dim, codebook_data, top_k=2,
+    def __init__(self, num_experts, hidden_state_dim, hidden_dim, code_dim, codebook_data, slicing=True, top_k=2,
                  importance_reg=0.01):
         super().__init__()
         # Check codebook size first
@@ -143,6 +143,8 @@ class ImportanceWeightedMoE(nn.Module):
 
         # Store the actual value
         self.num_experts = safe_num_experts
+        self.hidden_state_dim = hidden_state_dim
+        self.slicing = slicing
 
         # Initialize with existing code anchors up to safe_num_experts
         self.register_buffer('code_anchor',
@@ -154,13 +156,22 @@ class ImportanceWeightedMoE(nn.Module):
         self.init_orthogonal_feature_importance()
 
         # Keep your existing expert structure
-        self.experts = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(hidden_state_dim + code_dim, 2 * hidden_state_dim),
-                nn.GELU(),
-                nn.Linear(2 * hidden_state_dim, 1024 // num_experts)
-            ) for _ in range(num_experts)
-        ])
+        if self.slicing:
+            self.experts = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(hidden_state_dim + code_dim, 2 * hidden_state_dim),
+                    nn.GELU(),
+                    nn.Linear(2 * hidden_state_dim, 1024 // num_experts)
+                ) for _ in range(num_experts)
+            ])
+        else:
+            self.experts = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(hidden_state_dim + code_dim, 2 * hidden_state_dim),
+                    nn.GELU(),
+                    nn.Linear(2 * hidden_state_dim, 1024)  # Each expert produces full output
+                ) for _ in range(num_experts)
+            ])
 
         # Router and other components from your original implementation
         self.router = nn.Sequential(
@@ -288,12 +299,19 @@ class ImportanceWeightedMoE(nn.Module):
         expert_outputs = torch.stack([expert(expert_inputs[:, i]) for i, expert in enumerate(self.experts)], dim=1)
 
         # Combine expert outputs
-        slice_size = 1024 // self.num_experts
-        full_output = torch.zeros(batch_size, seq_len, 1024, device=h.device)
-        for i in range(self.num_experts):
-            start_idx = i * slice_size
-            end_idx = (i + 1) * slice_size
-            full_output[..., start_idx:end_idx] = expert_outputs[:, i, ..., :slice_size] * expert_weights[..., i:i + 1]
+        if self.slicing:
+            slice_size = 1024 // self.num_experts
+            full_output = torch.zeros(batch_size, seq_len, 1024, device=h.device)
+            for i in range(self.num_experts):
+                start_idx = i * slice_size
+                end_idx = (i + 1) * slice_size
+                full_output[..., start_idx:end_idx] = expert_outputs[:, i, ..., :slice_size] * expert_weights[...,
+                                                                                               i:i + 1]
+        else:
+            full_output = torch.zeros(batch_size, seq_len, 1024, device=h.device)
+            for i in range(self.num_experts):
+                # Each expert contributes to the entire output space based on its weight
+                full_output += expert_outputs[:, i] * expert_weights[..., i:i + 1]
 
         # 7. Calculate auxiliary losses
         expert_counts = expert_weights.sum(0)
@@ -321,6 +339,5 @@ class ImportanceWeightedMoE(nn.Module):
         # Penalize high similarity between different experts
         diversity_loss = off_diagonal.pow(2).sum() / (self.num_experts * (self.num_experts - 1))
         # Add to aux_loss with appropriate weight
-        aux_loss = aux_loss + 0.2 * diversity_loss
 
-        return full_output, aux_loss, importance_stats
+        return full_output, aux_loss, diversity_loss, importance_stats
