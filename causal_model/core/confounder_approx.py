@@ -186,8 +186,8 @@ class ConfounderPosterior(nn.Module):
 
         with (torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=True)):
             # Generate posterior parameters
-            # mu_post = self.confounder_post_mu_net(h, code_emb)
-            mu_post = torch.clamp(self.confounder_post_mu_net(h, code_emb), min=-10.0, max=10.0)
+            mu_post = self.confounder_post_mu_net(h, code_emb)
+            # mu_post = torch.clamp(self.confounder_post_mu_net(h, code_emb), min=-10.0, max=10.0)
             # self.check_dimensions(mu_post, (mu_post.size(0), mu_post.size(1), self.conf_dim), "mu_post")
 
             logvar_post = self.confounder_post_logvar_net(h, code_emb)
@@ -233,7 +233,7 @@ class ConfounderPosterior(nn.Module):
             )
 
             # Clip extreme values
-            kl_div = torch.clamp(kl_div, min=-100, max=100)
+            # kl_div = torch.clamp(kl_div, min=-100, max=100)
             return kl_div.sum(1).mean()
 
     def reparameterize(self, mu, logvar):
