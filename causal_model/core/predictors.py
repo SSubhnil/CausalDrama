@@ -105,9 +105,9 @@ class StateModulator(nn.Module):
 
 
 class MoETransitionHead(nn.Module):
-    def __init__(self, hidden_state_dim, hidden_dim, code_dim, conf_dim, num_experts, top_k, state_modulator, codebook_data,
+    def __init__(self, hidden_state_dim, hidden_dim, code_dim, conf_dim, num_experts, top_k, codebook_data,
                  compute_inv_loss=False,
-                 use_importance_weighted_moe=True, importance_reg=0.01):
+                 use_importance_weighted_moe=True, slicing=True,  importance_reg=0.01):
         super().__init__()
 
         # Choose between SparseCodeookMoE or FeatureImportanceWeightedMoE
@@ -115,8 +115,17 @@ class MoETransitionHead(nn.Module):
 
         self.hidden_state_dim = hidden_state_dim
         self.compute_inv_loss = compute_inv_loss
-        # State modulator
-        self.state_modulator = state_modulator
+
+        # Add confounder integration components
+        self.hidden_proj = nn.Linear(hidden_state_dim, hidden_state_dim)
+        self.conf_proj = nn.Linear(conf_dim, hidden_state_dim)
+
+        # Integration layer
+        self.integration = nn.Sequential(
+            nn.Linear(hidden_state_dim * 2, hidden_state_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_state_dim, hidden_state_dim)
+        )
 
         if use_importance_weighted_moe:
             # Create ImportanceWeightedMoE with parameters from original MOE
@@ -126,6 +135,7 @@ class MoETransitionHead(nn.Module):
                 hidden_dim=hidden_dim,
                 code_dim=code_dim,
                 codebook_data=codebook_data,
+                slicing=slicing,
                 top_k=top_k,
                 importance_reg=importance_reg
             )
@@ -141,7 +151,7 @@ class MoETransitionHead(nn.Module):
         # Confounding effect module
         # self.conf_mask = nn.Parameter(torch.zeros(hidden_dim))
         self.conf_mask = nn.Sequential(
-            nn.Linear(code_dim + conf_dim, hidden_dim),
+            nn.Linear(conf_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1024),  # Changed from hidden_dim to 1024
             nn.Sigmoid()
@@ -154,7 +164,7 @@ class MoETransitionHead(nn.Module):
 
         # Final Projection layer to Next-state logits
         # Output from SparseCodebookMoE is a 1024 projection, but not logits
-        self.final_proj = nn.Sequential(nn.Linear(1024, 1024 * 2),
+        self.final_proj = nn.Sequential(nn.Linear(1024, 1024 * 2), # or 2048 if output = torch.cat([moe_out, conf_effect], dim=-1)
                                         nn.Mish(),
                                         nn.Linear(1024 * 2, 1024),
                                         nn.Tanh()  # Maintains bounded outputs while allowing density learning
@@ -167,43 +177,61 @@ class MoETransitionHead(nn.Module):
         nn.init.zeros_(self.conf_mask[0].bias)  # Also initialize bias if needed
         # Register hook on the Linear layer's weight parameter specifically
         # self.conf_mask[0].weight.register_hook(lambda grad: grad * (torch.abs(grad) > 0.1).float())
-        self.conf_mask[0].weight.register_hook(lambda grad: grad * torch.sigmoid(10 * torch.abs(grad)))
+        # self.conf_mask[0].weight.register_hook(lambda grad: grad * torch.sigmoid(10 * torch.abs(grad)))
+        # More stable version lambda grad: grad * torch.clamp(torch.abs(grad), min=0.01, max=1.0)
 
     @profile
-    def forward(self, h_modulated, code_emb, u):
+    def forward(self, h, code_emb, u):
+
+        h_proj = self.hidden_proj(h)
+        u_proj = self.conf_proj(u)
+
         # Get stable code embeddings
         code_emb_stable = code_emb  # .detach()
 
-        # print("weighted_h shape nsitionHead:", h_modulated.shape)
-        # print("code_emb shape in MoETransiin MoETrationHead:", code_emb_stable.shape)
+        # Integrate confounder with hidden state
+        # Concatenate along feature dimension
+        combined = torch.cat([h_proj, u_proj], dim=-1)
+        integrated_h = self.integration(combined)
+
+        # Add residual connection to preserve original information
+        integrated_h = integrated_h + h
+
         # Process through MoE
-        moe_out, aux_loss, importance_stats = self.moe(h_modulated, code_emb_stable)
-        moe_out = torch.clamp(moe_out, -100, 100)  # Add reasonable bounds
+        moe_out, aux_loss, diversity_loss, importance_stats = self.moe(integrated_h, code_emb_stable)
+        # moe_out = torch.clamp(moe_out, -100, 100)  # Add reasonable bounds
 
         # Create modulation input
-        modulation_input = torch.cat([code_emb_stable, u], dim=-1)
+        # modulation_input = torch.cat([code_emb_stable, u], dim=-1)
 
         # Calculate confounding effect
-        f_conf_out = self.f_conf(u)  # [10, 128, 512]
-        mask_output = self.conf_mask(modulation_input)  # [10, 128, 512]
-        conf_effect = f_conf_out * mask_output  # Element-wise multiplication
+        # f_conf_out = self.f_conf(u)  # [10, 128, 512]
+        # mask_output = self.conf_mask(u)  # [10, 128, 512]
+        # conf_effect = f_conf_out * mask_output  # Element-wise multiplication
 
         # Compute sparsity loss
-        sparsity_loss = torch.mean(torch.abs(mask_output))
+        # sparsity_loss = torch.abs(torch.mean(mask_output) - 0.3) # Added -0.3 to control sparsity
 
         # Combine outputs
-        output = moe_out * (1 - mask_output) + conf_effect
+        # output = moe_out * (1 - mask_output) + conf_effect
+        # output = torch.cat([moe_out, conf_effect], dim=-1) # final_proj input is 2048 for this
+        # output = moe_out + conf_effect # Change final_proj input dim to 1024 to use this
 
         # Final projection to next state logits
-        next_state_logits = self.final_proj(output)
+        next_state_logits = self.final_proj(moe_out)
+
+        # Calculate regularization loss for integration network
+        # Target ~30% activation of the integration weights
+        mask_values = torch.sigmoid(self.integration[2].weight.mean(dim=1))
+        sparsity_loss = torch.abs(torch.mean(mask_values) - 0.3)
 
         # Compute total loss
-        total_loss = aux_loss + sparsity_loss
+        total_loss = aux_loss + sparsity_loss + diversity_loss
 
         assert next_state_logits.shape[-1] == 1024, \
             f"Prediction head output dim {next_state_logits.shape[-1]} != 1024"
 
-        return next_state_logits, total_loss, aux_loss, sparsity_loss
+        return next_state_logits, total_loss, aux_loss, diversity_loss, sparsity_loss
 
     def get_importance_weights(self):
         """Return the current importance weights for analysis"""
