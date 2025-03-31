@@ -150,7 +150,8 @@ class ImportanceWeightedMoE(nn.Module):
         # Feature importance weights for each expert
         self.feature_importance = nn.Parameter(torch.zeros(num_experts, hidden_state_dim))
         # Initialize with slight randomness to break symmetry
-        nn.init.normal_(self.feature_importance, mean=0.0, std=0.01)
+        # nn.init.normal_(self.feature_importance, mean=0.5, std=0.4)
+        self.init_orthogonal_feature_importance()
 
         # Keep your existing expert structure
         self.experts = nn.ModuleList([
@@ -171,12 +172,52 @@ class ImportanceWeightedMoE(nn.Module):
 
         # Importance regulation parameters
         self.importance_reg = importance_reg
-        self.importance_temperature = nn.Parameter(torch.tensor(1.0))
+        # self.importance_temperature = nn.Parameter(torch.tensor(1.0))
+
+        # Make temperature fixed or use decreasing schedule
+        self.register_buffer('importance_temperature', torch.tensor(0.5))
+
+        # Temperature annealing controls
+        self.register_buffer('initial_temperature', torch.tensor(1.0))
+        self.register_buffer('current_epoch', torch.tensor(0))
+        self.register_buffer('temperature_decay', torch.tensor(0.99))
+        self.register_buffer('min_temperature', torch.tensor(0.1))
 
         # Expert initialization (keeping your method)
         for expert, anchor in zip(self.experts, self.code_anchor):
             nn.init.normal_(expert[0].weight, mean=anchor[0].item(), std=0.01)
             nn.init.zeros_(expert[-1].weight)
+
+    # Orthogonal specialized initialization for feature importance
+    def init_orthogonal_feature_importance(self):
+        # Create a random matrix and orthogonalize it
+        feature_importance = torch.randn(self.num_experts, self.hidden_state_dim)
+
+        # Apply orthogonalization using SVD
+        if self.num_experts <= self.hidden_state_dim:
+            u, _, v = torch.svd(feature_importance)
+            orthogonal_weights = torch.matmul(u, v.transpose(-2, -1))
+        else:
+            # If more experts than dimensions, create clusters
+            orthogonal_weights = torch.zeros_like(feature_importance)
+            experts_per_dim = self.num_experts // self.hidden_state_dim + 1
+            for i in range(self.hidden_state_dim):
+                start_idx = i * experts_per_dim
+                end_idx = min((i + 1) * experts_per_dim, self.num_experts)
+                orthogonal_weights[start_idx:end_idx, i] = 1.0
+
+        # Assign to parameter with small random noise for symmetry breaking
+        self.feature_importance.data.copy_(orthogonal_weights + torch.randn_like(orthogonal_weights) * 0.01)
+
+    def update_temperature(self):
+        # Calculate new temperature with decay
+        new_temp = self.initial_temperature * (self.temperature_decay ** self.current_epoch)
+        # Clamp to minimum value
+        new_temp = torch.max(new_temp, self.min_temperature)
+        # Update current temperature
+        self.importance_temperature = new_temp
+        # Increment epoch counter
+        self.current_epoch += 1
 
     def forward(self, h, code_emb):
         """
@@ -210,12 +251,12 @@ class ImportanceWeightedMoE(nn.Module):
             router_logits = torch.mm(
                 F.normalize(code_emb_flat, p=2, dim=1),
                 code_anchor_norm.t()
-            ).reshape(B, T, -1) * 0.125
+            ).reshape(B, T, -1) * 1.0
         else:
             router_logits = torch.mm(
                 F.normalize(code_emb, p=2, dim=1),
                 code_anchor_norm.t()
-            ) * 0.125
+            ) * 1.0
 
         # 4. Get FULL expert weight distribution (no top-k filtering)
         expert_weights = F.gumbel_softmax(router_logits, tau=0.1, hard=False)
@@ -262,7 +303,7 @@ class ImportanceWeightedMoE(nn.Module):
         # Calculate importance entropies
         importance_entropies = -(importance * torch.log(importance + 1e-8)).sum(dim=-1).mean(dim=0)
         avg_entropy = importance_entropies.mean()
-        aux_loss = routing_loss - self.importance_reg * avg_entropy
+        aux_loss = routing_loss + self.importance_reg * avg_entropy  # replaced - with + to encourage specialization
 
         # Create stats dictionary
         importance_stats = {
@@ -270,5 +311,16 @@ class ImportanceWeightedMoE(nn.Module):
             'mean': importance.mean(dim=-1).squeeze().tolist(),
             'std': importance.std(dim=-1).squeeze().tolist()
         }
+
+        # Calculate similarity between experts' importance weights
+        importance_flat = self.feature_importance  # [num_experts, hidden_dim]
+        similarity_matrix = torch.mm(importance_flat, importance_flat.t())  # [num_experts, num_experts]
+        # Remove diagonal (self-similarity)
+        identity = torch.eye(self.num_experts, device=similarity_matrix.device)
+        off_diagonal = similarity_matrix * (1 - identity)
+        # Penalize high similarity between different experts
+        diversity_loss = off_diagonal.pow(2).sum() / (self.num_experts * (self.num_experts - 1))
+        # Add to aux_loss with appropriate weight
+        aux_loss = aux_loss + 0.2 * diversity_loss
 
         return full_output, aux_loss, importance_stats
