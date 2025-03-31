@@ -19,7 +19,7 @@ from sub_models.transformer_model import StochasticTransformerKVCache
 from mamba_ssm import MambaWrapperModel, MambaConfig, InferenceParams, update_graph_cache
 
 from causal_model.core.integrator import CausalModel
-from causal_model.core.predictors import MoETransitionHead, ImprovedRewardHead, TerminationPredictor, StateModulator
+from causal_model.core.predictors import MoETransitionHead, ImprovedRewardHead, TerminationPredictor
 import agents
 from line_profiler import profile
 from torch.distributions.independent import Independent
@@ -243,10 +243,14 @@ class DistHead(nn.Module):
 
     def forward_prior(self, h, code_emb_tr, u_post):
         # next_state_logits, h_modulated, total_tr_loss, aux_loss, sparsity_loss = self.tr_head(h, code_emb_tr, u_post)
-        logits, total_tr_loss, aux_loss, sparsity_loss = self.prior_head(h, code_emb_tr, u_post)
+        logits, total_tr_loss, aux_loss, diversity_loss, sparsity_loss = self.prior_head(h, code_emb_tr, u_post)
         logits = rearrange(logits, "B L (K C) -> B L K C", K=self.stoch_dim)
         logits = self.unimix(logits, self.unimix_ratio)
-        return logits, total_tr_loss, aux_loss, sparsity_loss
+        return logits, total_tr_loss, aux_loss, diversity_loss, sparsity_loss
+
+    def update_temperature(self):
+        # Calls the update_temperature() in ImportanceWeightedMoE in networks.py
+        self.prior_head.moe.update_temperature()
 
 
 class RewardHead(nn.Module):
@@ -416,9 +420,9 @@ class WorldModel(nn.Module):
         #     'tr_aux_loss': self.predictor_params.Transition.AuxiliaryWeight,
         #     'tr_sparsity_weight': self.predictor_params.Transition.MaskSparsityWeight
         # })
-        self.state_modulator = StateModulator(self.hidden_state_dim, self.predictor_params.Transition.HiddenDim,
-                                              self.code_dim_tr, self.confounder_params.ConfDim,
-                                              self.predictor_params.ComputeInvarianceLoss)
+        # self.state_modulator = StateModulator(self.hidden_state_dim, self.predictor_params.Transition.HiddenDim,
+        #                                       self.code_dim_tr, self.confounder_params.ConfDim,
+        #                                       self.predictor_params.ComputeInvarianceLoss)
 
         self.tr_head = MoETransitionHead(hidden_state_dim=self.hidden_state_dim,
                                          hidden_dim=self.predictor_params.Transition.HiddenDim,
@@ -426,9 +430,9 @@ class WorldModel(nn.Module):
                                          conf_dim=self.confounder_params.ConfDim,
                                          num_experts=self.predictor_params.Transition.NumOfExperts,
                                          top_k=self.predictor_params.Transition.TopK,
-                                         state_modulator=self.state_modulator,
                                          codebook_data=codebook_data,
-                                         use_importance_weighted_moe=self.predictor_params.Transition.UseImportanceWeightedMoE
+                                         use_importance_weighted_moe=self.predictor_params.Transition.UseImportanceWeightedMoE,
+                                         slicing=self.predictor_params.Transition.Slicing
                                          )
 
         self.re_head = ImprovedRewardHead(num_codes=self.num_codes_re,
@@ -555,6 +559,7 @@ class WorldModel(nn.Module):
         self.scaler = torch.cuda.amp.GradScaler(
             enabled=self.use_amp and config.Models.WorldModel.dtype is not torch.bfloat16)
 
+    # state_modulator
     def encode_obs(self, obs):
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
             embedding = self.encoder(obs)
@@ -574,11 +579,11 @@ class WorldModel(nn.Module):
             last_dist_feat = dist_feat[:, -1:]
             # Add causal model processing
             quant_output_dict, u_post, _ = self.causal_model(last_dist_feat, 1000)
-            modulated_feat, _ = self.state_modulator(last_dist_feat, quant_output_dict['quantized_tr'],
-                                                                  u_post, 1000)
+            # modulated_feat, _ = self.state_modulator(last_dist_feat, quant_output_dict['quantized_tr'],
+            #                                                       u_post, 1000)
             code_emb_tr = quant_output_dict['quantized_tr'][:, -1:]  # Get transition codes
 
-            prior_logits, _, _, _ = self.dist_head.forward_prior(modulated_feat, code_emb_tr, u_post)
+            prior_logits, _, _, _, _ = self.dist_head.forward_prior(last_dist_feat, code_emb_tr, u_post)
             prior_sample = self.straight_through_gradient(prior_logits, sample_mode="random_sample", identifier="522")
             prior_flattened_sample = self.flatten_sample(prior_sample)
             # Add this line to ensure consistent sequence dimensions
@@ -803,55 +808,53 @@ class WorldModel(nn.Module):
             return False
 
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp and not self.use_cg):
+            # Get hidden state from context
             context_dist_feat = get_hidden_state(context_latent, sample_action, inference_params)
             inference_params.seqlen_offset += context_dist_feat.shape[1]
-            # Unmodulated Context Dist Feat
-            self.unmod_dist_feat_buffer[:, 0:1] = context_dist_feat[:, -1:]
 
-            # Modulated Context Dist Feat
+            # Store hidden state directly
+            self.dist_feat_buffer[:, 0:1] = context_dist_feat[:, -1:]
+
+            # Process through causal model
             quantizer_output, u, _ = self.causal_model(context_dist_feat, global_step)
-            mod_context_dist_feat, _ = self.state_modulator(context_dist_feat, quantizer_output['hard_tr'],
-                                                                         u, global_step)
-            context_prior_logits, _, _, _ = self.dist_head.forward_prior(mod_context_dist_feat,
-                                                                         quantizer_output['hard_tr'], u)
+
+            # Forward through transition head directly without modulation
+            context_prior_logits, _, _, _, _ = self.dist_head.forward_prior(context_dist_feat,
+                                                                            quantizer_output['quantized_tr'], u)
+
+            # Get next state prediction
             context_prior_sample = self.straight_through_gradient(context_prior_logits, logger=logger,
                                                                   global_step=global_step,
                                                                   identifier='context_prior')
             context_flattened_sample = self.flatten_sample(context_prior_sample)
 
-            dist_feat_list, sample_list = [mod_context_dist_feat[:, -1:]], [context_flattened_sample[:, -1:]]
+            # Initialize lists for tracking states and actions
+            dist_feat_list, sample_list = [context_dist_feat[:, -1:]], [context_flattened_sample[:, -1:]]
             self.sample_buffer[:, 0:1] = context_flattened_sample[:, -1:]
-            self.dist_feat_buffer[:, 0:1] = mod_context_dist_feat[:, -1:]
+            self.dist_feat_buffer[:, 0:1] = context_dist_feat[:, -1:]
             action_list, old_logits_list = [], []
+
             i = 0
             while not should_stop(sample_list[-1], inference_params):
+                # Sample action from agent
                 action, logits = agent.sample(
                     torch.cat([self.sample_buffer[:, i:i + 1], self.dist_feat_buffer[:, i:i + 1]], dim=-1))
                 action_list.append(action)
                 self.action_buffer[:, i:i + 1] = action
                 old_logits_list.append(logits)
+                # Get new hidden state
                 dist_feat = get_hidden_state(sample_list[-1], action_list[-1], inference_params)
-                # Store unmodulated
-                self.unmod_dist_feat_buffer[:, i + 1:i + 2] = dist_feat[:, -1:, :]
-
-                # Process and store modulated
+                # Process through causal model
                 quantizer_output_x, u_x, _ = self.causal_model(dist_feat, global_step)
-                dist_feat, _ = self.state_modulator(dist_feat, quantizer_output_x['hard_tr'], u_x,
-                                                                 global_step)
+                # Store hidden state directly
                 dist_feat_list.append(dist_feat)
                 self.dist_feat_buffer[:, i + 1:i + 2] = dist_feat[:, -1:, :]
+                # Update inference params
                 inference_params.seqlen_offset += sample_list[-1].shape[1]
-                # if repetition_penalty == 1.0:
-                #     sampled_tokens = sample_tokens(scores[-1], inference_params)
-                # else:
-                #     logits = modify_logit_for_repetition_penalty(
-                #         scores[-1].clone(), sequences_cat, repetition_penalty
-                #     )
-                #     sampled_tokens = sample_tokens(logits, inference_params)
-                #     sequences_cat = torch.cat([sequences_cat, sampled_tokens], dim=1)
-                # print("dist_feat_list[-1]:", dist_feat_list[-1].shape)
-                prior_logits, _, _, _ = self.dist_head.forward_prior(dist_feat_list[-1], quantizer_output_x['hard_tr'],
-                                                                     u_x)
+                # Predict next state with transition head
+                prior_logits, _, _, _, _ = self.dist_head.forward_prior(dist_feat, quantizer_output_x['quantized_tr'],
+                                                                        u_x)
+
                 prior_sample = self.straight_through_gradient(prior_logits, logger=logger, global_step=global_step,
                                                               identifier='prior_logits')
                 prior_flattened_sample = self.flatten_sample(prior_sample)
@@ -859,26 +862,26 @@ class WorldModel(nn.Module):
                 self.sample_buffer[:, i + 1:i + 2] = prior_flattened_sample
                 i += 1
 
-            # sample_tensor = torch.cat(sample_list, dim=1)
-            # dist_feat_tensor = torch.cat(dist_feat_list, dim=1)
-            # action_tensor = torch.cat(action_list, dim=1)
+            # Combine gathered logits
             old_logits_tensor = torch.cat(old_logits_list, dim=1)
-            quantizer_output_re, u_re, _ = self.causal_model(self.unmod_dist_feat_buffer[:, :-1], global_step)
-            mod_dist_feat, _ = self.state_modulator(self.unmod_dist_feat_buffer[:, :-1],
-                                                                 quantizer_output_re['hard_tr'], u_re, global_step)
-            reward_hat_tensor, _ = self.reward_decoder(mod_dist_feat, quantizer_output_re['hard_re'],
+            # Process the entire sequence for reward and termination predictions
+            trajectory_dist_feat = self.dist_feat_buffer[:, :-1]
+            quantizer_output_re, u_re, _ = self.causal_model(trajectory_dist_feat, global_step)
+            # Reward prediction directly using hidden states
+            reward_hat_tensor, _ = self.reward_decoder(trajectory_dist_feat, quantizer_output_re['quantized_re'],
                                                        quantizer_output_re['q_re'])
             self.reward_hat_buffer = self.symlog_twohot_loss_func.decode(reward_hat_tensor)
-            termination_hat_tensor = self.termination_decoder(mod_dist_feat)
+            # Termination prediction
+            termination_hat_tensor = self.termination_decoder(trajectory_dist_feat)
             self.termination_hat_buffer = termination_hat_tensor > 0
 
-            if log_video:
-                obs_hat = self.image_decoder(self.sample_buffer[::imagine_batch_size // 4]) * 255
-                obs_hat = torch.clamp(obs_hat, 0, 255)
-                img_frames = obs_hat.permute(1, 2, 3, 0, 4)
-                img_frames = img_frames.reshape(imagine_batch_length + 1, 3, 64,
-                                                64 * 4).cpu().float().detach().numpy().astype(np.uint8)
-                logger.log("Imagine/predict_video", img_frames, global_step=global_step)
+        if log_video:
+            obs_hat = self.image_decoder(self.sample_buffer[::imagine_batch_size // 4]) * 255
+            obs_hat = torch.clamp(obs_hat, 0, 255)
+            img_frames = obs_hat.permute(1, 2, 3, 0, 4)
+            img_frames = img_frames.reshape(imagine_batch_length + 1, 3, 64,
+                                            64 * 4).cpu().float().detach().numpy().astype(np.uint8)
+            logger.log("Imagine/predict_video", img_frames, global_step=global_step)
 
         return torch.cat([self.sample_buffer, self.dist_feat_buffer],
                          dim=-1), self.action_buffer, old_logits_tensor, torch.cat(
@@ -913,24 +916,25 @@ class WorldModel(nn.Module):
                 dist_feat.detach(), global_step, training=True)
             # STATE MODULATOR has bidirection gradient flow
             # Allow gradients form modulator to causal model
-            mod_dist_feat, inv_loss = self.state_modulator(dist_feat,
-                                                            quantizer_output['quantized_tr'],
-                                                            u_post, global_step)
+            # mod_dist_feat, inv_loss = self.state_modulator(dist_feat,
+            #                                                 quantizer_output['quantized_tr'].detach(),
+            #                                                 u_post.detach(), global_step)
             # PREDICTION HEADS (with directed gradient flow)
             # For transition prediction - aloow gradients to modulator but not to causal model internals
-            prior_logits, total_tr_loss, aux_loss, sparsity_loss = \
-                self.dist_head.forward_prior(mod_dist_feat,
-                                             quantizer_output['quantized_tr'],  # Detach codes
-                                             u_post)  # Detach posterior
+            prior_logits, total_tr_loss, aux_loss, diversity_loss, sparsity_loss = self.dist_head.forward_prior(
+                dist_feat,
+                quantizer_output['quantized_tr'],  # Detach codes
+                u_post)  # Detach posterior
+            self.dist_head.update_temperature()  # Update MoE temperature
             # decoding reward and termination with dist_feat
-            reward_hat, re_head_loss = self.reward_decoder(mod_dist_feat,
+            reward_hat, re_head_loss = self.reward_decoder(dist_feat,
                                                            quantizer_output['quantized_re'],
                                                            quantizer_output['q_re'])
-            pred_loss = 0.1 * inv_loss + 0.01 * aux_loss + 0.05 * sparsity_loss
+            pred_loss = 0.01 * aux_loss + 0.05 * sparsity_loss + 0.2 * diversity_loss
 
             # Common loss calculations
             reward_decoded = self.symlog_twohot_loss_func.decode(reward_hat)  # Convert to scalar values
-            termination_hat = self.termination_decoder(mod_dist_feat)
+            termination_hat = self.termination_decoder(dist_feat)
 
             """Model losses from causal model"""
             # env loss
@@ -947,7 +951,8 @@ class WorldModel(nn.Module):
                                                                                            :-1].detach())
             # Separate world model losses from causal model losses
             # Added a dynamics loss weight 0.8
-            world_model_loss = reconstruction_loss + reward_loss + termination_loss + dynamics_loss + 0.1 * representation_loss + pred_loss + re_head_loss
+            prediction_head_loss = pred_loss + re_head_loss
+            world_model_loss = reconstruction_loss + reward_loss + termination_loss + dynamics_loss + 0.1 * representation_loss + prediction_head_loss
             causal_model_loss = causal_loss
             # total_loss = reconstruction_loss + reward_loss + termination_loss + dynamics_loss + 0.1 * representation_loss + causal_loss + pred_loss + re_head_loss
 
