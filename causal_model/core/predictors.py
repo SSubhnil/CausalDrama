@@ -117,15 +117,15 @@ class MoETransitionHead(nn.Module):
         self.compute_inv_loss = compute_inv_loss
 
         # Add confounder integration components
-        self.hidden_proj = nn.Linear(hidden_state_dim, hidden_state_dim)
-        self.conf_proj = nn.Linear(conf_dim, hidden_state_dim)
+        # self.hidden_proj = nn.Linear(hidden_state_dim, hidden_state_dim)
+        # self.conf_proj = nn.Linear(conf_dim, hidden_state_dim)
 
         # Integration layer
-        self.integration = nn.Sequential(
-            nn.Linear(hidden_state_dim * 2, hidden_state_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_state_dim, hidden_state_dim)
-        )
+        # self.integration = nn.Sequential(
+        #     nn.Linear(hidden_state_dim * 2, hidden_state_dim),
+        #     nn.SiLU(),
+        #     nn.Linear(hidden_state_dim, hidden_state_dim)
+        # )
 
         if use_importance_weighted_moe:
             # Create ImportanceWeightedMoE with parameters from original MOE
@@ -134,6 +134,7 @@ class MoETransitionHead(nn.Module):
                 hidden_state_dim=hidden_state_dim,
                 hidden_dim=hidden_dim,
                 code_dim=code_dim,
+                conf_dim=conf_dim,
                 codebook_data=codebook_data,
                 slicing=slicing,
                 top_k=top_k,
@@ -182,23 +183,25 @@ class MoETransitionHead(nn.Module):
 
     @profile
     def forward(self, h, code_emb, u):
+        # print("h shape", h.shape)
+        # print("u shape", u.shape)
 
-        h_proj = self.hidden_proj(h)
-        u_proj = self.conf_proj(u)
+        # h_proj = self.hidden_proj(h)
+        # u_proj = self.conf_proj(u)
 
         # Get stable code embeddings
         code_emb_stable = code_emb  # .detach()
 
         # Integrate confounder with hidden state
         # Concatenate along feature dimension
-        combined = torch.cat([h_proj, u_proj], dim=-1)
-        integrated_h = self.integration(combined)
+        combined = torch.cat([h, u], dim=-1)
+        # integrated_h = self.integration(combined)
 
         # Add residual connection to preserve original information
-        integrated_h = integrated_h + h
+        # integrated_h = integrated_h + h
 
         # Process through MoE
-        moe_out, aux_loss, diversity_loss, importance_stats = self.moe(integrated_h, code_emb_stable)
+        moe_out, aux_loss, diversity_loss, importance_stats = self.moe(combined, code_emb_stable)
         # moe_out = torch.clamp(moe_out, -100, 100)  # Add reasonable bounds
 
         # Create modulation input
@@ -222,8 +225,9 @@ class MoETransitionHead(nn.Module):
 
         # Calculate regularization loss for integration network
         # Target ~30% activation of the integration weights
-        mask_values = torch.sigmoid(self.integration[2].weight.mean(dim=1))
-        sparsity_loss = torch.abs(torch.mean(mask_values) - 0.3)
+        # mask_values = torch.sigmoid(self.integration[2].weight.mean(dim=1))
+        # sparsity_loss = torch.abs(torch.mean(mask_values) - 0.3)
+        sparsity_loss = 0.0 #  Remove this if using integration
 
         # Compute total loss
         total_loss = aux_loss + sparsity_loss + diversity_loss

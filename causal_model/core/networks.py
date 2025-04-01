@@ -130,7 +130,8 @@ class SparseCodebookMoE(nn.Module):
 
 
 class ImportanceWeightedMoE(nn.Module):
-    def __init__(self, num_experts, hidden_state_dim, hidden_dim, code_dim, codebook_data, slicing=True, top_k=2,
+    def __init__(self, num_experts, hidden_state_dim, hidden_dim, code_dim, conf_dim, codebook_data, slicing=True,
+                 top_k=2,
                  importance_reg=0.01):
         super().__init__()
         # Check codebook size first
@@ -144,13 +145,14 @@ class ImportanceWeightedMoE(nn.Module):
         # Store the actual value
         self.num_experts = safe_num_experts
         self.hidden_state_dim = hidden_state_dim
+        self.conf_dim = conf_dim
         self.slicing = slicing
 
         # Initialize with existing code anchors up to safe_num_experts
         self.register_buffer('code_anchor',
                              codebook_data[:safe_num_experts])
         # Feature importance weights for each expert
-        self.feature_importance = nn.Parameter(torch.zeros(num_experts, hidden_state_dim))
+        self.feature_importance = nn.Parameter(torch.zeros(num_experts, hidden_state_dim + conf_dim))
         # Initialize with slight randomness to break symmetry
         # nn.init.normal_(self.feature_importance, mean=0.5, std=0.4)
         self.init_orthogonal_feature_importance()
@@ -159,7 +161,7 @@ class ImportanceWeightedMoE(nn.Module):
         if self.slicing:
             self.experts = nn.ModuleList([
                 nn.Sequential(
-                    nn.Linear(hidden_state_dim + code_dim, 2 * hidden_state_dim),
+                    nn.Linear(hidden_state_dim + conf_dim, 2 * hidden_state_dim),
                     nn.GELU(),
                     nn.Linear(2 * hidden_state_dim, 1024 // num_experts)
                 ) for _ in range(num_experts)
@@ -167,7 +169,7 @@ class ImportanceWeightedMoE(nn.Module):
         else:
             self.experts = nn.ModuleList([
                 nn.Sequential(
-                    nn.Linear(hidden_state_dim + code_dim, 2 * hidden_state_dim),
+                    nn.Linear(hidden_state_dim + conf_dim, 2 * hidden_state_dim),
                     nn.GELU(),
                     nn.Linear(2 * hidden_state_dim, 1024)  # Each expert produces full output
                 ) for _ in range(num_experts)
@@ -202,7 +204,7 @@ class ImportanceWeightedMoE(nn.Module):
     # Orthogonal specialized initialization for feature importance
     def init_orthogonal_feature_importance(self):
         # Create a random matrix and orthogonalize it
-        feature_importance = torch.randn(self.num_experts, self.hidden_state_dim)
+        feature_importance = torch.randn(self.num_experts, self.hidden_state_dim + self.conf_dim)
 
         # Apply orthogonalization using SVD
         if self.num_experts <= self.hidden_state_dim:
@@ -293,10 +295,10 @@ class ImportanceWeightedMoE(nn.Module):
         weighted_h = h * importance  # [batch_size, num_experts, seq_len, hidden_dim] or [batch_size, num_experts, hidden_dim]
 
         # Prepare inputs for all experts
-        expert_inputs = torch.cat([weighted_h, code_emb.unsqueeze(1).expand(-1, self.num_experts, -1, -1)], dim=-1)
+        # expert_inputs = torch.cat([weighted_h, code_emb.unsqueeze(1).expand(-1, self.num_experts, -1, -1)], dim=-1)
 
         # Process through all experts simultaneously
-        expert_outputs = torch.stack([expert(expert_inputs[:, i]) for i, expert in enumerate(self.experts)], dim=1)
+        expert_outputs = torch.stack([expert(weighted_h[:, i]) for i, expert in enumerate(self.experts)], dim=1)
 
         # Combine expert outputs
         if self.slicing:
