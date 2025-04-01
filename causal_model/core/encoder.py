@@ -6,18 +6,20 @@ import torch.nn.functional as F
 from .networks import MLP
 
 class CausalEncoder(nn.Module):
-    def __init__(self, hidden_state_dim: int, tr_proj_dim: int, re_proj_dim: int, hidden_dim: int, embedding_mode: str='continuous'):
+    def __init__(self, hidden_state_dim: int, action_dim: int, stoch_dim: int, tr_proj_dim: int, re_proj_dim: int, hidden_dim: int,
+                 combined_input_dim: int, embedding_mode: str='continuous'):
         super().__init__()
         self.hidden_state_dim = hidden_state_dim
         self.tr_proj_dim = tr_proj_dim
         self.re_proj_dim = re_proj_dim
         self.hidden_dim = hidden_dim
         self.embedding_mode = embedding_mode
+        input_dim = combined_input_dim if combined_input_dim is not None else (hidden_state_dim + (action_dim or 0) + (stoch_dim or 0))
 
         # Feature Projection Layers
-        self.tr_proj = MLP(self.hidden_state_dim, self.tr_proj_dim, self.hidden_dim,
+        self.tr_proj = MLP(input_dim, self.tr_proj_dim, self.hidden_dim,
                            activation=nn.SiLU)
-        self.re_proj = MLP(self.hidden_state_dim, self.re_proj_dim, self.hidden_dim,
+        self.re_proj = MLP(input_dim, self.re_proj_dim, self.hidden_dim,
                            activation=nn.SiLU)
 
         # Embedding normalization for continuous embedding mode

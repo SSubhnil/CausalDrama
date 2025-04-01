@@ -362,8 +362,8 @@ class WorldModel(nn.Module):
             kernel=config.Models.WorldModel.Encoder.Kernel,
             padding=config.Models.WorldModel.Encoder.Padding,
             input_size=config.Models.WorldModel.Encoder.InputSize,
-            dtype=config.Models.WorldModel.dtype, device=device
-        )
+            dtype=config.Models.WorldModel.dtype, device=device)
+
         if self.model == 'Transformer':
             self.sequence_model = StochasticTransformerKVCache(
                 stoch_dim=self.stoch_flattened_dim,
@@ -406,7 +406,10 @@ class WorldModel(nn.Module):
         # Causal model definition
         self.causal_model = CausalModel(
             params=config,
-            device=self.device
+            device=self.device,
+            action_dim=action_dim,
+            stoch_dim=self.stoch_flattened_dim,
+            d_model=self.hidden_state_dim
         )
         codebook_data = self.causal_model.quantizer.tr_quantizer.codebook.data.clone()
 
@@ -559,7 +562,6 @@ class WorldModel(nn.Module):
         self.scaler = torch.cuda.amp.GradScaler(
             enabled=self.use_amp and config.Models.WorldModel.dtype is not torch.bfloat16)
 
-    # state_modulator
     def encode_obs(self, obs):
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
             embedding = self.encoder(obs)
@@ -577,11 +579,14 @@ class WorldModel(nn.Module):
                 dist_feat = self.sequence_model(latent, action, inference_params)
 
             last_dist_feat = dist_feat[:, -1:]
+            action_unsqueezed = action.unsqueeze(-1)
+            combined_input = torch.cat([latent, action_unsqueezed, dist_feat], dim=-1)
             # Add causal model processing
-            quant_output_dict, u_post, _ = self.causal_model(last_dist_feat, 1000)
+            quant_output_dict, u_post, _ = self.causal_model(combined_input, 1000)
             # modulated_feat, _ = self.state_modulator(last_dist_feat, quant_output_dict['quantized_tr'],
             #                                                       u_post, 1000)
             code_emb_tr = quant_output_dict['quantized_tr'][:, -1:]  # Get transition codes
+            u_post = u_post[:, -1:, :]  # Keep only the last timestep
 
             prior_logits, _, _, _, _ = self.dist_head.forward_prior(last_dist_feat, code_emb_tr, u_post)
             prior_sample = self.straight_through_gradient(prior_logits, sample_mode="random_sample", identifier="522")
@@ -814,9 +819,14 @@ class WorldModel(nn.Module):
 
             # Store hidden state directly
             self.dist_feat_buffer[:, 0:1] = context_dist_feat[:, -1:]
+            sample_action_unsqueezed = sample_action.unsqueeze(-1)
+
+            # Concat z, a, and h.
+            combined_input = torch.cat([context_latent, sample_action_unsqueezed, context_dist_feat], dim=-1)
 
             # Process through causal model
-            quantizer_output, u, _ = self.causal_model(context_dist_feat, global_step)
+            # quantizer_output, u, _,  = self.causal_model(context_dist_feat, global_step)
+            quantizer_output, u, _, = self.causal_model(combined_input, global_step)
 
             # Forward through transition head directly without modulation
             context_prior_logits, _, _, _, _ = self.dist_head.forward_prior(context_dist_feat,
@@ -844,8 +854,12 @@ class WorldModel(nn.Module):
                 old_logits_list.append(logits)
                 # Get new hidden state
                 dist_feat = get_hidden_state(sample_list[-1], action_list[-1], inference_params)
+                action_list_unsqueezed = action_list[-1].unsqueeze(-1)
+                # Combine z, a and h
+                combined_input_1 = torch.cat([sample_list[-1], action_list_unsqueezed, dist_feat], dim=-1)
                 # Process through causal model
-                quantizer_output_x, u_x, _ = self.causal_model(dist_feat, global_step)
+                # quantizer_output_x, u_x, _ = self.causal_model(dist_feat, global_step)
+                quantizer_output_x, u_x, _ = self.causal_model(combined_input_1, global_step)
                 # Store hidden state directly
                 dist_feat_list.append(dist_feat)
                 self.dist_feat_buffer[:, i + 1:i + 2] = dist_feat[:, -1:, :]
@@ -866,7 +880,13 @@ class WorldModel(nn.Module):
             old_logits_tensor = torch.cat(old_logits_list, dim=1)
             # Process the entire sequence for reward and termination predictions
             trajectory_dist_feat = self.dist_feat_buffer[:, :-1]
-            quantizer_output_re, u_re, _ = self.causal_model(trajectory_dist_feat, global_step)
+            trajectory_samples = self.sample_buffer[:, :-1]  # Get stored flattened samples
+            trajectory_actions = self.action_buffer  # Get stored actions
+            trajectory_actions_unsqueezed = trajectory_actions.unsqueeze(-1)
+            combined_trajectory_input = torch.cat(
+                [trajectory_samples, trajectory_actions_unsqueezed, trajectory_dist_feat], dim=-1)
+
+            quantizer_output_re, u_re, _ = self.causal_model(combined_trajectory_input, global_step)
             # Reward prediction directly using hidden states
             reward_hat_tensor, _ = self.reward_decoder(trajectory_dist_feat, quantizer_output_re['quantized_re'],
                                                        quantizer_output_re['q_re'])
@@ -900,6 +920,7 @@ class WorldModel(nn.Module):
             sample = self.straight_through_gradient(post_logits, sample_mode="random_sample",
                                                     global_step=global_step, logger=logger, identifier="post_logits")
             flattened_sample = self.flatten_sample(sample)
+            # flattened_sample = self.encode_obs(obs)
 
             # decoding image
             obs_hat = self.image_decoder(flattened_sample)
@@ -911,9 +932,13 @@ class WorldModel(nn.Module):
             else:
                 dist_feat = self.sequence_model(flattened_sample, action)
 
+            action_unsqueezed = action.unsqueeze(-1)  # Reshape from [16, 128] to [16, 128, 1]
+
+            combined_input = torch.cat([flattened_sample, action_unsqueezed, dist_feat.detach()], dim=-1)
+
             # 1. Pass the dist_feat to the causal model encoder -> quantizer -> confounding
             quantizer_output, u_post, causal_loss, quant_loss, prior_loss, post_loss = self.causal_model(
-                dist_feat.detach(), global_step, training=True)
+                combined_input, global_step, training=True)
             # STATE MODULATOR has bidirection gradient flow
             # Allow gradients form modulator to causal model
             # mod_dist_feat, inv_loss = self.state_modulator(dist_feat,
