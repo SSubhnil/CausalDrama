@@ -8,9 +8,11 @@ from .confounder_approx import ConfounderPosterior, ConfounderPrior, MixtureConf
 
 
 class CausalModel(nn.Module):
-    def __init__(self, params, device):
+    def __init__(self, params, device, action_dim, stoch_dim, d_model):
         super().__init__()
-        self.hidden_state_dim = params.Models.WorldModel.HiddenStateDim
+        self.hidden_state_dim = d_model
+        self.action_dim = action_dim
+        self.stoch_dim = stoch_dim
         self.code_dim_tr = params.Models.CausalModel.TrCodeDim
         self.code_dim_re = params.Models.CausalModel.ReCodeDim
         self.num_codes_tr = params.Models.CausalModel.NumCodesTr
@@ -18,6 +20,11 @@ class CausalModel(nn.Module):
         self.hidden_dim = params.Models.CausalModel.HiddenDim
         self.use_confounder = params.Models.CausalModel.UseConfounder
         self.device = device
+        combined_input_dim = self.hidden_state_dim
+        if action_dim is not None:
+            combined_input_dim += 1  # For 1D action after unsqueeze
+        if stoch_dim is not None:
+            combined_input_dim += stoch_dim
 
         self.loss_weights = {
             # Primary Prediction Losses
@@ -29,9 +36,12 @@ class CausalModel(nn.Module):
         """Encoder"""
         self.encoder_params = params.Models.CausalModel.Encoder
         self.causal_encoder = CausalEncoder(hidden_state_dim=self.hidden_state_dim,
+                                            action_dim=self.action_dim,
+                                            stoch_dim=self.stoch_dim,
                                             tr_proj_dim=self.encoder_params.TransProjDim,
                                             re_proj_dim=self.encoder_params.RewProjDim,
                                             hidden_dim=self.encoder_params.HiddenDim,
+                                            combined_input_dim=combined_input_dim,
                                             embedding_mode=self.encoder_params.Embedding)
 
         """
@@ -141,10 +151,12 @@ class CausalModel(nn.Module):
 
             # Posterior losses - (optional) detach prior parameters
             if not self.use_mixture_prior:
-                kl_loss = self.confounder_post_net.gaussian_KL(mu_post, logvar_post, mu_prior, logvar_prior)
+                kl_loss = self.confounder_post_net.gaussian_KL(mu_post, logvar_post, mu_prior.detach(),
+                                                               logvar_prior.detach())
             else:
                 kl_loss = self.confounder_post_net.gaussian_KL_to_mixture(mu_post, logvar_post,
-                                                                          mix_weights, mu_prior, logvar_prior)
+                                                                          mix_weights, mu_prior.detach(),
+                                                                          logvar_prior.detach())
 
             # Regularization losses
             post_l2_reg, post_sparsity = self.confounder_post_net.regularization_loss()
