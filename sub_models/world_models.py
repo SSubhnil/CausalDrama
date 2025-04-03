@@ -435,7 +435,8 @@ class WorldModel(nn.Module):
                                          top_k=self.predictor_params.Transition.TopK,
                                          codebook_data=codebook_data,
                                          use_importance_weighted_moe=self.predictor_params.Transition.UseImportanceWeightedMoE,
-                                         slicing=self.predictor_params.Transition.Slicing
+                                         slicing=self.predictor_params.Transition.Slicing,
+                                         use_simple_mlp=self.predictor_params.Transition.UseSimpleMLP
                                          )
 
         self.re_head = ImprovedRewardHead(num_codes=self.num_codes_re,
@@ -934,7 +935,8 @@ class WorldModel(nn.Module):
 
             action_unsqueezed = action.unsqueeze(-1)  # Reshape from [16, 128] to [16, 128, 1]
 
-            combined_input = torch.cat([flattened_sample, action_unsqueezed, dist_feat.detach()], dim=-1)
+            combined_input = torch.cat([flattened_sample.detach(), action_unsqueezed.detach(), dist_feat.detach()],
+                                       dim=-1)
 
             # 1. Pass the dist_feat to the causal model encoder -> quantizer -> confounding
             quantizer_output, u_post, causal_loss, quant_loss, prior_loss, post_loss = self.causal_model(
@@ -950,7 +952,8 @@ class WorldModel(nn.Module):
                 dist_feat,
                 quantizer_output['quantized_tr'],  # Detach codes
                 u_post)  # Detach posterior
-            self.dist_head.update_temperature()  # Update MoE temperature
+            if self.tr_head.use_importance_weighted_moe:
+                self.dist_head.update_temperature()  # Update MoE temperature
             # decoding reward and termination with dist_feat
             reward_hat, re_head_loss = self.reward_decoder(dist_feat,
                                                            quantizer_output['quantized_re'],
