@@ -1,15 +1,17 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import time
 from line_profiler import profile
-from .encoder import CausalEncoder
-from .quantizer import DualVQQuantizer
-from .confounder_approx import ConfounderPosterior, ConfounderPrior, MixtureConfounderPrior
+from .encoder import CausalEncoder, ConvolutionalTrajectoryEncoder
+from .quantizer import DualVQQuantizer, TrajectoryQuantizer
+from .networks import CausalMaskGenerator
 
 
 class CausalModel(nn.Module):
     def __init__(self, params, device, action_dim, stoch_dim, d_model):
         super().__init__()
+        self.device = device
         self.hidden_state_dim = d_model
         self.action_dim = action_dim
         self.stoch_dim = stoch_dim
@@ -19,7 +21,7 @@ class CausalModel(nn.Module):
         self.num_codes_re = params.Models.CausalModel.NumCodesRe
         self.hidden_dim = params.Models.CausalModel.HiddenDim
         self.use_confounder = params.Models.CausalModel.UseConfounder
-        self.device = device
+
         combined_input_dim = self.hidden_state_dim
         if action_dim is not None:
             combined_input_dim += 1  # For 1D action after unsqueeze
@@ -35,15 +37,22 @@ class CausalModel(nn.Module):
 
         """Encoder"""
         self.encoder_params = params.Models.CausalModel.Encoder
-        self.causal_encoder = CausalEncoder(hidden_state_dim=self.hidden_state_dim,
-                                            action_dim=self.action_dim,
-                                            stoch_dim=self.stoch_dim,
-                                            tr_proj_dim=self.encoder_params.TransProjDim,
-                                            re_proj_dim=self.encoder_params.RewProjDim,
-                                            hidden_dim=self.encoder_params.HiddenDim,
-                                            combined_input_dim=combined_input_dim,
-                                            embedding_mode=self.encoder_params.Embedding)
-
+        # self.causal_encoder = CausalEncoder(hidden_state_dim=self.hidden_state_dim,
+        #                                     action_dim=self.action_dim,
+        #                                     stoch_dim=self.stoch_dim,
+        #                                     tr_proj_dim=self.encoder_params.TransProjDim,
+        #                                     re_proj_dim=self.encoder_params.RewProjDim,
+        #                                     hidden_dim=self.encoder_params.HiddenDim,
+        #                                     combined_input_dim=combined_input_dim,
+        #                                     embedding_mode=self.encoder_params.Embedding)
+        self.causal_encoder = ConvolutionalTrajectoryEncoder(input_dim=combined_input_dim,
+                                                             hidden_dim=self.encoder_params.HiddenDim,
+                                                             projection_dim=self.encoder_params.TransProjDim,
+                                                             embedding_mode=self.encoder_params.Embedding)
+        # For mini-trajectories or windowed
+        self.num_windows = self.encoder_params.NumWindows
+        self.window_size = self.encoder_params.WindowSize
+        self.stride = self.encoder_params.Stride
         """
         QUANTIZER
         Losses:
@@ -54,138 +63,150 @@ class CausalModel(nn.Module):
                 beta_tr, beta_re
         """
         self.quantizer_params = params.Models.CausalModel.Quantizer
-        self.quantizer = DualVQQuantizer(code_dim_tr=self.code_dim_tr,
-                                         code_dim_re=self.code_dim_re,
-                                         num_codes_tr=self.num_codes_tr,
-                                         num_codes_re=self.num_codes_re,
-                                         beta_tr=self.quantizer_params.BetaTransition,
-                                         beta_re=self.quantizer_params.BetaReward,
-                                         tr_temperature=self.quantizer_params.TransitionTemp,
-                                         tr_min_temperature=self.quantizer_params.TransitionMinTemperature,
-                                         tr_anneal_factor=self.quantizer_params.TransitionAnnealFactor,
-                                         re_temperature=self.quantizer_params.RewardTemp,
-                                         re_min_temperature=self.quantizer_params.RewardMinTemperature,
-                                         re_anneal_factor=self.quantizer_params.RewardAnnealFactor,
-                                         normalize=self.quantizer_params.NormalizedInputs,
-                                         coupling=self.quantizer_params.Coupling,
-                                         sparsity_weight=self.quantizer_params.SparsityWeight,  # Coupling sparsity
-                                         lambda_couple=self.quantizer_params.LambdaCouple,
-                                         hidden_dim=self.hidden_dim,
-                                         use_cdist=self.quantizer_params.UseCDist
-                                         )
+        # self.quantizer = DualVQQuantizer(code_dim_tr=self.code_dim_tr,
+        #                                  code_dim_re=self.code_dim_re,
+        #                                  num_codes_tr=self.num_codes_tr,
+        #                                  num_codes_re=self.num_codes_re,
+        #                                  beta_tr=self.quantizer_params.BetaTransition,
+        #                                  beta_re=self.quantizer_params.BetaReward,
+        #                                  tr_temperature=self.quantizer_params.TransitionTemp,
+        #                                  tr_min_temperature=self.quantizer_params.TransitionMinTemperature,
+        #                                  tr_anneal_factor=self.quantizer_params.TransitionAnnealFactor,
+        #                                  re_temperature=self.quantizer_params.RewardTemp,
+        #                                  re_min_temperature=self.quantizer_params.RewardMinTemperature,
+        #                                  re_anneal_factor=self.quantizer_params.RewardAnnealFactor,
+        #                                  normalize=self.quantizer_params.NormalizedInputs,
+        #                                  coupling=self.quantizer_params.Coupling,
+        #                                  sparsity_weight=self.quantizer_params.SparsityWeight,  # Coupling sparsity
+        #                                  lambda_couple=self.quantizer_params.LambdaCouple,
+        #                                  hidden_dim=self.hidden_dim,
+        #                                  use_cdist=self.quantizer_params.UseCDist
+        #                                  )
 
-        """
-        CONFOUNDER VARIATIONAL INFERENCE
-            Prior Losses:
-                Code_alignment_loss, prior_regularization()
-            Posterior Losses:
-                regularization_loss(): l2_reg, code_sparsity
-                kl_loss
-            Prior Loss weights:
-                code_alignment_loss, reg_loss_weight
-            Post Loss weights:
-                reg_loss(): l2_reg_weight, code_sparsity_weight
-                kl_loss_weights        
-        """
+        self.quantizer = TrajectoryQuantizer(num_codes=self.num_codes_tr,
+                                             code_dim=self.code_dim_tr,
+                                             beta=self.quantizer_params.BetaTransition,
+                                             initial_temp=self.quantizer_params.TransitionTemp,
+                                             use_cdist=self.quantizer_params.UseCDist,
+                                             normalize=self.quantizer_params.NormalizedInputs)
 
-        self.confounder_params = params.Models.CausalModel.Confounder
-        self.use_mixture_prior = self.confounder_params.UseMixturePrior
-        self.loss_weights.update({
-            'prior_reg_weight': self.confounder_params.PriorRegWeight,
-            'prior_code_align': self.confounder_params.PriorCodeAlign,
-            'post_reg': self.confounder_params.PostReg,
-            'post_sparsity': self.confounder_params.PostCodeSparsity,
-            'kl_loss_weight': self.confounder_params.PostKLWeight
-        })
-        if not self.use_mixture_prior:
-            self.confounder_prior_net = ConfounderPrior(num_codes=self.num_codes_tr,
-                                                        code_dim=self.code_dim_tr,
-                                                        conf_dim=self.confounder_params.ConfDim,
-                                                        hidden_state_proj_dim=self.encoder_params.TransProjDim,
-                                                        momentum=self.confounder_params.PriorMomentum)
-        else:
-            self.confounder_prior_net = MixtureConfounderPrior(num_codes=self.num_codes_tr,
-                                                               code_dim=self.code_dim_tr,
-                                                               conf_dim=self.confounder_params.ConfDim,
-                                                               hidden_state_proj_dim=self.encoder_params.TransProjDim,
-                                                               momentum=self.confounder_params.PriorMomentum)
-
-        self.confounder_post_net = ConfounderPosterior(code_dim=self.code_dim_tr,
-                                                       conf_dim=self.confounder_params.ConfDim,
-                                                       num_codes=self.num_codes_tr,
-                                                       hidden_dim=self.confounder_params.HiddenDim)
+        self.mask_generator = CausalMaskGenerator(hidden_state_dim=self.hidden_state_dim,
+                                                  code_dim=self.code_dim_tr,
+                                                  conf_dim=self.confounder_params.ConfDim,
+                                                  latent_dim=self.stoch_dim,
+                                                  action_dim=self.action_dim,  # For 1D action after unsqueeze
+                                                  )
 
     @profile
     def forward(self, h, global_step, training=False):
+        # Projection of trajectories into h [B, trajectory_projection]
+        """Process trajectory into multiple windows, encode and quantize them"""
+        # 1. Sample windows
+        windowed_trajectories = self.sample_windows(h)  # [B*M, W, D]
 
-        # Projection of raw hidden state into h_tr and h_re
-        h_proj_tr, h_proj_re = self.causal_encoder(h)
+        # 2. Encode each window as an independent trajectory
+        encoded_windows = self.causal_encoder(windowed_trajectories)  # [B*M, code_dim]
+
+        # 3. Quantize the encoded windows
+        quantizer_output, quant_loss = self.quantizer(encoded_windows, global_step, training)
+
+        # 4. Reshape outputs to separate batch and window dimensions
+        B = h.shape[0]
+        M = self.num_windows
+
+        # Reshape quantized outputs to [B, M, code_dim]
+        reshaped_output = {}
+        for key, value in quantizer_output.items():
+            if isinstance(value, torch.Tensor):
+                # Skip reshaping scalar values or None values
+                if value.dim() > 0:  # Check if it's not a scalar
+                    new_shape = [B, M] + list(value.shape[1:])
+                    reshaped_output[key] = value.reshape(new_shape)
+                else:
+                    reshaped_output[key] = value
+            else:
+                reshaped_output[key] = value
 
         # Different paths for training and inference
         if training:
             self.anneal_quantizer_temperature(global_step)
-
-            # Full training path with all losses
-            quant_output_dict = self.quantizer(h_proj_tr, h_proj_re, training=True)
-            code_emb_tr = quant_output_dict['quantized_tr']
-            quant_loss = quant_output_dict['loss']
-
-            if not self.use_mixture_prior:
-                mu_prior, logvar_prior = self.confounder_prior_net(h_proj_tr,
-                                                                   code_ids=quant_output_dict['hard_tr'].argmax(-1))
-            else:
-                mix_weights, mu_prior, logvar_prior = self.confounder_prior_net(h_proj_tr,
-                                                                                code_ids=quant_output_dict[
-                                                                                    'hard_tr'].argmax(
-                                                                                    -1) if 'hard_tr' in quant_output_dict else None)
-
-            # Prior losses
-            prior_code_alignment_loss = self.confounder_prior_net.code_alignment_loss() * self.loss_weights[
-                'prior_code_align']
-            prior_reg_loss = self.confounder_prior_net.prior_regularization(mu_prior) * self.loss_weights[
-                'prior_reg_weight']
-            prior_loss = prior_code_alignment_loss + prior_reg_loss
-
-            # Confounder posterior
-            u_post, mu_post, logvar_post = self.confounder_post_net(h_proj_tr, code_emb_tr)
-
-            # Posterior losses - (optional) detach prior parameters
-            if not self.use_mixture_prior:
-                kl_loss = self.confounder_post_net.gaussian_KL(mu_post, logvar_post, mu_prior.detach(),
-                                                               logvar_prior.detach())
-            else:
-                kl_loss = self.confounder_post_net.gaussian_KL_to_mixture(mu_post, logvar_post,
-                                                                          mix_weights, mu_prior.detach(),
-                                                                          logvar_prior.detach())
-
-            # Regularization losses
-            post_l2_reg, post_sparsity = self.confounder_post_net.regularization_loss()
-            post_l2_reg = post_l2_reg * self.loss_weights['post_reg']
-            post_sparsity = post_sparsity * self.loss_weights['post_sparsity']
-            kl_loss = kl_loss * self.loss_weights['kl_loss_weight']
-
-            # Combine all losses
-            posterior_loss = kl_loss + post_l2_reg + post_sparsity
-            causal_loss = quant_loss + prior_loss + posterior_loss
-            return quant_output_dict, u_post, causal_loss, quant_loss, prior_loss, posterior_loss
+            return reshaped_output, quant_loss
 
         else:  # Inference
-            # Optimized inference path - skip unnecessary computations
-            quant_output_dict = self.quantizer(h_proj_tr, h_proj_re, training=False)
-            code_emb_tr = quant_output_dict['quantized_tr']
+            return reshaped_output, None
 
-            # Only calculate what's needed for inference
-            if not self.use_mixture_prior:
-                mu_prior, logvar_prior = self.confounder_prior_net(h_proj_tr.detach(),
-                                                                   code_ids=quant_output_dict['hard_tr'].argmax(-1))
+    def world_causal_alignment_loss(self, dist_feat, code_emb, temperature=0.1):
+        """
+        Implements InfoNCE contrastive loss to align world model hidden states
+        with causal model trajectory codes using windowed trajectories
+
+        Args:
+            dist_feat: Features from world model sequence [B, T, hidden_dim]
+            code_emb: Code embeddings from causal model [B, M, code_dim]
+                     (already arranged as batch x windows x features)
+            temperature: Temperature parameter for softmax
+
+        Returns:
+            InfoNCE loss for alignment
+        """
+        # 1. Sample windows from world model features using existing function
+        B, T, D = dist_feat.shape
+        M = code_emb.shape[1]  # Number of windows
+
+        # Use the existing sample_windows function
+        windowed_features = self.sample_windows(dist_feat)  # [B*M, W, D]
+
+        # 2. For each window, use the final state as the representation
+        window_features = windowed_features[:, -1, :]  # [B*M, D]
+
+        # 3. Project to common space if dimensions differ
+        if hasattr(self, 'alignment_projector'):
+            window_features = self.alignment_projector(window_features)
+
+        # 4. Reshape window features to match code_emb shape
+        window_features = window_features.reshape(B, M, -1)  # [B, M, D]
+
+        # 5. Compute InfoNCE loss for each window position
+        total_loss = 0
+        for m in range(M):
+            # Get features and codes for this window position
+            win_feat = window_features[:, m, :]  # [B, D]
+            win_code = code_emb[:, m, :]  # [B, code_dim]
+
+            # Normalize for cosine similarity
+            win_feat_norm = F.normalize(win_feat, p=2, dim=1)
+            win_code_norm = F.normalize(win_code, p=2, dim=1)
+
+            # Compute similarity matrix
+            similarity = torch.mm(win_feat_norm, win_code_norm.t()) / temperature  # [B, B]
+
+            # InfoNCE loss - positives are along diagonal
+            labels = torch.arange(B, device=dist_feat.device)
+            loss = F.cross_entropy(similarity, labels)
+            total_loss += loss
+
+        return total_loss / M  # Average across windows
+
+    def sample_windows(self, trajectory):
+        """Sample fixed-size windows from a trajectory"""
+        B, L, D = trajectory.shape
+
+        # Calculate stride to evenly cover the trajectory
+        if self.stride is None:
+            if L <= self.window_size:
+                stride = 1
             else:
-                _, mu_prior, logvar_prior = self.confounder_prior_net(h_proj_tr.detach(),
-                                                                      code_ids=quant_output_dict['hard_tr'].argmax(
-                                                                          -1) if 'hard_tr' in quant_output_dict else None)
-            # Skip KL and regularization loss calculations
-            u_post = self._inference_posterior(h_proj_tr, code_emb_tr, mu_prior, logvar_prior)
+                stride = max(1, (L - self.window_size) // (self.num_windows - 1))
+        else:
+            stride = self.stride
 
-            return quant_output_dict, u_post, None
+        windows = []
+        for i in range(self.num_windows):
+            start_idx = min(i * stride, max(0, L - self.window_size))
+            windows.append(trajectory[:, start_idx:start_idx + self.window_size])
+
+        # Stack along batch dimension to process as independent trajectories
+        return torch.cat(windows, dim=0)  # [B*M, W, D]
 
     def _inference_posterior(self, h, code_emb, mu_prior, logvar_prior):
         """Fast inference-only posterior calculation"""
@@ -213,4 +234,3 @@ class CausalModel(nn.Module):
 
         # Apply temperature annealing
         self.quantizer.anneal_temperature(effective_epoch)
-
