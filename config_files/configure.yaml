@@ -3,7 +3,7 @@ BasicSettings:
   ImageChannel: 3
   ReplayBufferOnGPU: True
   Seed: 3710
-  Env_name: ALE/Pong-v5
+  Env_name: ALE/DemonAttack-v5
   Device: cuda:0
   Use_amp: True
   Use_cg: True
@@ -108,19 +108,22 @@ Models:
 
   CausalModel:
     dtype: float32
-    TrCodeDim: 256               # [16, 24, 32, 64] Dimension of codebook entries
-    ReCodeDim: 128
-    NumCodesTr: 128           # Transition codebook size
-    NumCodesRe: 64            # Reward codebook size
+    TrCodeDim: 512               # [16, 24, 32, 64] Dimension of codebook entries
+    ReCodeDim: 512
+    NumCodesTr: 16           # Transition codebook size
+    NumCodesRe: 16            # Reward codebook size
     HiddenDim: 512           # Hidden dimension for MLPs
     UseConfounder: False      # Flag to use confounder encoder and approximator
 
     Encoder:                  # Avoid bottlenecking -> hidden_dim == hidden_state_dim
       Embedding: continuous   # projection / continuous/ discrete(WIP)
-      TransProjDim: 256       # Dim of projection of h into transition continuous embeddings
-      RewProjDim: 128         # Dim of projection of h into reward continuous embeddings
-      HiddenDim: 512          # Hidden layer dimensions
+      TransProjDim: 512       # %%%%% Should be same as TrCodeDim
+      RewProjDim: 512         # %%%%% Should be same as ReCodeDim
+      HiddenDim: 2048          # Hidden layer dimensions
       Activation: SiLU        # Activation function
+      NumWindows: 16          # For windowed trajectories
+      WindowSize: 16          # Size of mini-trajectories
+      Stride: None            # Stride to evenly cover the trajectory space with CNN
 
     Quantizer:
       TransitionTemp: 1.0     # Initial Gumbel softmax temp for transition codebook
@@ -131,27 +134,27 @@ Models:
       RewardAnnealFactor: 0.95          # Temp decay per update for reward codebook
       BetaTransition: 0.25              # Commitment loss weight for transitions
       BetaReward: 0.25                  # Commitment loss weight for rewards
-      NormalizedInputs: True  # L2 normalize inputs/codebook
+      NormalizedInputs: False  # L2 normalize inputs/codebook
       Coupling: False          # Enable codebook coupling
       SparsityWeight: 0.1     # Sparsity Loss for coupling
       LambdaCouple: 0.1       # Coupling loss weight
       UseCDist: False
 
     Confounder:
-      UseMixturePrior: False   # Mixture of priors over codes
-      ConfDim: 128            # Confounder Dimensions - same as NumCodesTr
+      UseMixturePrior: True   # Mixture of priors over codes
+      ConfDim: 16            # Confounder Dimensions %%%%%%%% same as NumCodesTr
       HiddenDim: 512          # Hidden layer dimensions
       PriorLayers: 2          # MLP layers for prior network
       PostLayers: 2           # MLP layers for posterior
       AffineInitStd: 0.01     # Affine param initialization
       MinLogVar: -6.0         # Posterior variance bounds
       MaxLogVar: 0.0
-      PriorMomentum: 0.97
+      PriorMomentum: 0.90
       PriorRegWeight: 0.01    # Regularization loss weight
       PriorCodeAlign: 0.1     # Weight for code alignment loss
       PostReg: 0.001          # Posterior L2 regularization
       PostCodeSparsity: 0.01  #
-      PostKLWeight: 0.3
+      PostKLWeight: 0.5      # was 0.3
 
     Modulation:
       MaskInitScale: 0.5      # Initial scale for modulation
@@ -162,13 +165,15 @@ Models:
     Predictors:
       ComputeInvarianceLoss: True # Enforces invariance in codes
       InvarianceWeight: 0.1     # Mechanism invariance loss
-      TransitionWeight: 1.0 # Main objective - next state prediction
+      TransitionWeight: 1.0     # Main objective - next state prediction
       RewardWeight: 1.0         # Main objective - reward prediction
       TerminationWeight: 0.5    # Secondary Objective - episode termination
       Transition:
+        UseSimpleMLP: False      # Used instead of MoE
         UseImportanceWeightedMoE: True
-        NumOfExperts: 8
-        TopK: 3
+        Slicing: True        # Experts predict over sliced next-state logits
+        NumOfExperts: 4      # 4, 8, 16, 32
+        TopK: 3              # Redundant
         HiddenDim: 512    # Keep it 512 for now. The posterior is sensitive to this size.
         MaskSparsityWeight: 0.05
         AuxiliaryWeight: 0.1
