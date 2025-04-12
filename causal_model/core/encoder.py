@@ -41,3 +41,40 @@ class CausalEncoder(nn.Module):
                 re_proj = self.re_norm(re_proj)
 
             return tr_proj, re_proj
+
+class ConvolutionalTrajectoryEncoder(nn.Module):
+    def __init__(self, input_dim, hidden_dim, projection_dim, embedding_mode='projection'):
+        super().__init__()
+        self.temporal_conv = nn.Sequential(
+            nn.Conv1d(input_dim, hidden_dim, kernel_size=8, stride=4, padding=2),
+            # nn.BatchNorm1d(hidden_dim),
+            nn.SiLU(),
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=5, stride=2, padding=2),
+            # nn.BatchNorm1d(hidden_dim),
+            nn.SiLU(),
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=5, stride=2, padding=2),
+            # nn.BatchNorm1d(hidden_dim),
+            nn.SiLU()
+        )
+        # Adaptive pooling to fixed size
+        self.pool = nn.AdaptiveAvgPool1d(8)
+        # Final projection
+        if embedding_mode == 'continuous':
+            self.projection = nn.Sequential(
+                nn.Linear(hidden_dim * 8, projection_dim),
+                nn.Tanh()  # Continuous embedding with bounded range
+            )
+        else:
+            self.projection = nn.Linear(hidden_dim * 8, projection_dim)
+
+    def forward(self, x):
+        # x shape: [B, L, D]
+        # Transpose for 1D convolution [B, D, L]
+        x = x.transpose(1, 2)
+        # Apply convolutions to reduce sequence length
+        x = self.temporal_conv(x)  # [B, hidden_dim, L/16]
+        # Pool to fixed length
+        x = self.pool(x)  # [B, hidden_dim, 8]
+        # Flatten and project
+        x = x.reshape(x.size(0), -1)
+        return self.projection(x)
