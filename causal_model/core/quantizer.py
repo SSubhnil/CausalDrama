@@ -52,30 +52,27 @@ class VQQuantizer(nn.Module):
 
             # Flatten 3D input to 2D for processing
             if is_3d:
-                h_flat = h.reshape(-1, h.shape[-1])  # [B, T, D] -> [B*T, D]
-            else:
-                h_flat = h
+                h = h.reshape(-1, h.shape[-1])  # [B, T, D] -> [B*T, D]
 
             # Apply normalization if needed
             if self.normalize:
-                h_flat_norm = F.normalize(h_flat, p=2, dim=1, eps=1e-6)
+                h = F.normalize(h, p=2, dim=1, eps=1e-6)
                 codebook = F.normalize(self.codebook, p=2, dim=1, eps=1e-6)
             else:
-                h_flat_norm = h_flat
                 codebook = self.codebook
 
             # Compute distances - optimized for either mode
             if self.normalize:
                 # For normalized vectors, cosine similarity is proportional to squared distance
-                similarities = torch.matmul(h_flat_norm, codebook.t())
+                similarities = torch.matmul(h, codebook.t())
                 distances = 2 - 2 * similarities
             else:
                 if self.use_cdist:
-                    distances = torch.cdist(h_flat_norm, codebook, p=2) ** 2
+                    distances = torch.cdist(h, codebook, p=2) ** 2
                 else:
-                    h_sq = torch.sum(h_flat_norm ** 2, dim=1, keepdim=True)
+                    h_sq = torch.sum(h ** 2, dim=1, keepdim=True)
                     codebook_sq = torch.sum(codebook ** 2, dim=1).view(1, -1)
-                    distances = h_sq + codebook_sq - 2 * torch.matmul(h_flat_norm, codebook.t())
+                    distances = h_sq + codebook_sq - 2 * torch.matmul(h, codebook.t())
             # Compute soft assignments
             # Optimization: For inference, replace with deterministic argmin
             # Branch for training vs. inference
@@ -92,8 +89,8 @@ class VQQuantizer(nn.Module):
                 # diff = h_flat_norm - c_tilde_flat
                 # codebook_loss = (diff.detach() ** 2).mean()
                 # commitment_loss = (diff ** 2).mean()
-                codebook_loss = F.mse_loss(c_tilde_flat, h_flat_norm.detach())
-                commitment_loss = F.mse_loss(h_flat_norm, c_tilde_flat.detach())
+                codebook_loss = F.mse_loss(c_tilde_flat, h.detach())
+                commitment_loss = F.mse_loss(h, c_tilde_flat.detach())
                 loss = codebook_loss + self.beta * commitment_loss
 
                 # Straight-through estimator for training
@@ -256,3 +253,83 @@ class DualVQQuantizer(nn.Module):
             self.tr_quantizer.temperature = new_temp
         if which == 'both' or which == 're':
             self.re_quantizer.temperature = new_temp
+
+
+class TrajectoryQuantizer(nn.Module):
+    """
+    Quantizes trajectory projections into discrete codes using a single VQQuantizer
+    Processes 2D input [B, proj_dim] where proj_dim is the projection dimension
+    """
+
+    def __init__(self, num_codes: int, code_dim: int,
+                 beta: float = 0.25, initial_temp: float = 1.0,
+                 use_cdist: bool = True, normalize: bool = True):
+        super().__init__()
+        self.vq = VQQuantizer(
+            num_codes=num_codes,
+            code_dim=code_dim,
+            beta=beta,
+            initial_temp=initial_temp,
+            use_cdist=use_cdist,
+            normalize=normalize
+        )
+
+    def forward(self, trajectories: torch.Tensor, training=False):
+        """
+        Input: trajectories [B, L, D]
+        Output: Quantized trajectory codes [B, code_dim]
+        """
+
+        # Process through original VQQuantizer
+        q, c_tilde, c_hard, c_quantized, loss, indices = self.vq(trajectories, training)
+
+        return {
+            'quantized': c_quantized,  # [B, code_dim]
+            'indices': indices,  # [B]
+            'loss': loss,
+            'q': q,  # [B, num_codes]
+            'c_tilde': c_tilde,  # [B, code_dim]
+            'c_hard': c_hard  # [B, code_dim]
+        }
+
+    def info_nce_contrastive_loss(self, c_quantized, temperature=0.1, windowed=True):
+        """
+        Implements InfoNCE loss as in DOMINO paper
+
+        Args:
+            c_quantized: Quantized codes [B, code_dim]
+        """
+        if windowed:
+            B, M, D = c_quantized.shape
+            # Flatten batch and window dimensions
+            c_quantized = c_quantized.reshape(-1, D)  # [B*M, D]
+            batch_size = B * M
+        else:
+            batch_size = c_quantized.shape[0]
+
+        # Normalize codes for cosine similarity
+        c_norm = F.normalize(c_quantized, p=2, dim=1)
+
+        # Compute similarity matrix
+        similarity = torch.mm(c_norm, c_norm.t()) / temperature
+
+        # InfoNCE uses positives (same context) and negatives (different contexts)
+        # For each example, "positive" is itself, "negatives" are all others
+        labels = torch.arange(batch_size, device=c_quantized.device)
+
+        # Cross entropy loss (equivalent to InfoNCE)
+        loss = F.cross_entropy(similarity, labels)
+
+        return loss
+
+    def anneal_temperature(self, epoch):
+        """Delegate temperature annealing to underlying VQQuantizer"""
+        self.vq.set_temperature(max(
+            self.vq.initial_temp * (0.97 ** epoch),
+            self.vq.temperature
+        ))
+
+    def set_temperature(self, new_temp: float):
+        """Direct temperature control"""
+        self.vq.set_temperature(new_temp)
+
