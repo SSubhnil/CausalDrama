@@ -152,7 +152,7 @@ class ImportanceWeightedMoE(nn.Module):
         self.register_buffer('code_anchor',
                              codebook_data[:safe_num_experts])
         # Feature importance weights for each expert
-        self.feature_importance = nn.Parameter(torch.zeros(num_experts, hidden_state_dim + conf_dim))
+        self.feature_importance = nn.Parameter(torch.zeros(num_experts, hidden_state_dim))
         # Initialize with slight randomness to break symmetry
         # nn.init.normal_(self.feature_importance, mean=0.5, std=0.4)
         self.init_orthogonal_feature_importance()
@@ -161,7 +161,7 @@ class ImportanceWeightedMoE(nn.Module):
         if self.slicing:
             self.experts = nn.ModuleList([
                 nn.Sequential(
-                    nn.Linear(hidden_state_dim + conf_dim, 2 * hidden_state_dim),
+                    nn.Linear(hidden_state_dim, 2 * hidden_state_dim),
                     nn.GELU(),
                     nn.Linear(2 * hidden_state_dim, 1024 // num_experts)
                 ) for _ in range(num_experts)
@@ -169,7 +169,7 @@ class ImportanceWeightedMoE(nn.Module):
         else:
             self.experts = nn.ModuleList([
                 nn.Sequential(
-                    nn.Linear(hidden_state_dim + conf_dim, 2 * hidden_state_dim),
+                    nn.Linear(hidden_state_dim, 2 * hidden_state_dim),
                     nn.GELU(),
                     nn.Linear(2 * hidden_state_dim, 1024)  # Each expert produces full output
                 ) for _ in range(num_experts)
@@ -343,3 +343,77 @@ class ImportanceWeightedMoE(nn.Module):
         # Add to aux_loss with appropriate weight
 
         return full_output, aux_loss, diversity_loss, importance_stats
+
+
+class CausalMaskGenerator(nn.Module):
+    def __init__(self, hidden_state_dim: int, code_dim: int, conf_dim: int,
+                 latent_dim: int, action_dim: int, hidden_dim=1024):
+        super().__init__()
+        self.total_feature_dim = latent_dim + action_dim
+
+        # Process code and confounder information
+        self.code_encoder = nn.Sequential(
+            nn.Linear(code_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim))
+
+        self.mask_generator = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, self.total_feature_dim),
+            nn.Sigmoid()  # COntinuous mask in [0, 1]
+        )
+
+        nn.init.orthogonal_(self.code_encoder[0].weight, gain=0.8)  # Orthogonal initialization with reduced gain
+        nn.init.constant_(self.code_encoder[0].bias, 0.2)  # Small positive bias promotes initial feature passing
+
+        with torch.no_grad():
+            # Start with masks that pass most information through (value near 1.0)
+            nn.init.constant_(self.mask_generator[-2].weight, 0.01)  # Small weights for final layer
+            nn.init.constant_(self.mask_generator[-2].bias, 2.0)  # Sigmoid(2.0) ≈ 0.88
+
+            # Use Kaiming initialization with fan_out for intermediate layers
+            for m in self.mask_generator[:-2]:
+                if isinstance(m, nn.Linear):
+                    nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='silu')
+
+        # Initialize temperature parameter for controlling mask discreteness
+        self.register_buffer('temperature', torch.tensor(1.0))
+        self.register_buffer('min_temperature', torch.tensor(0.1))
+        self.register_buffer('temperature_decay', torch.tensor(0.9995))
+
+    # Feature-specific initialization - OPTIONAL
+    def init_mask_feature_specific(self, latent_dim, action_dim, group_size=8):
+        """Initialize masks with feature group specialization"""
+        # Final layer weights initialization
+        final_layer = self.mask_generator[-2]
+
+        # Group features for specialized initialization
+        features_per_group = (latent_dim + action_dim) // group_size
+        for i in range(group_size):
+            start_idx = i * features_per_group
+            end_idx = min((i + 1) * features_per_group, latent_dim + action_dim)
+
+            # Higher initial attention to group-specific features
+            final_layer.weight.data[:, start_idx:end_idx] *= 1.5
+
+    def forward(self, code_emb, temperature=1.0):
+        """
+        Args:
+            code_emb: Quantized code embeddings from VQ-VAE
+            u_post: COnfounder variables from posterior
+            temperature: Temperature for controlling mask sharpness
+        """
+        # Combine code and confounder
+        code_features = self.code_encoder(code_emb)
+
+        # Generate mask
+        mask_logits = self.mask_generator(code_features)
+
+        # Apply temperature for controlling discreteness
+        if temperature != 1.0:
+            mask = torch.sigmoid(mask_logits / temperature)
+        else:
+            mask = mask_logits
+
+        return mask
