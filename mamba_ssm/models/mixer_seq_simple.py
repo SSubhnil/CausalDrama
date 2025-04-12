@@ -244,9 +244,14 @@ class MixerModel(nn.Module):
             for i, layer in enumerate(self.layers)
         }
 
-    def forward(self, samples, action, inference_params=None, **mixer_kwargs):
+    def tokenizer(self, samples, action):
         action = F.one_hot(action.long(), self.action_dim).float()
         hidden_states = self.stem(torch.cat([samples, action], dim=-1))
+        return hidden_states
+
+    def forward(self, hidden_states, inference_params=None, **mixer_kwargs):
+        # action = F.one_hot(action.long(), self.action_dim).float()
+        # hidden_states = self.stem(torch.cat([samples, action], dim=-1))
             
         residual = None
         for layer in self.layers:
@@ -330,11 +335,11 @@ class MambaWrapperModel(nn.Module, GenerationMixin):
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         return self.backbone.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
 
-    def forward(self, samples, action, inference_params=None, num_last_tokens=0, **mixer_kwargs):
+    def forward(self, tokens, inference_params=None, num_last_tokens=0, **mixer_kwargs):
         """
         num_last_tokens: if > 0, only return the logits for the last n tokens
         """
-        hidden_states = self.backbone(samples, action, inference_params=inference_params, **mixer_kwargs)
+        hidden_states = self.backbone(tokens, inference_params=inference_params, **mixer_kwargs)
         if num_last_tokens > 0:
             hidden_states = hidden_states[:, -num_last_tokens:]
         # lm_logits = self.lm_head(hidden_states)
