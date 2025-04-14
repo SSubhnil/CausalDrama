@@ -152,7 +152,7 @@ class ImportanceWeightedMoE(nn.Module):
         self.register_buffer('code_anchor',
                              codebook_data[:safe_num_experts])
         # Feature importance weights for each expert
-        self.feature_importance = nn.Parameter(torch.zeros(num_experts, hidden_state_dim))
+        self.feature_importance = nn.Parameter(torch.zeros(num_experts, hidden_state_dim + conf_dim))
         # Initialize with slight randomness to break symmetry
         # nn.init.normal_(self.feature_importance, mean=0.5, std=0.4)
         self.init_orthogonal_feature_importance()
@@ -161,7 +161,7 @@ class ImportanceWeightedMoE(nn.Module):
         if self.slicing:
             self.experts = nn.ModuleList([
                 nn.Sequential(
-                    nn.Linear(hidden_state_dim, 2 * hidden_state_dim),
+                    nn.Linear(hidden_state_dim + conf_dim, 2 * hidden_state_dim),
                     nn.GELU(),
                     nn.Linear(2 * hidden_state_dim, 1024 // num_experts)
                 ) for _ in range(num_experts)
@@ -169,7 +169,7 @@ class ImportanceWeightedMoE(nn.Module):
         else:
             self.experts = nn.ModuleList([
                 nn.Sequential(
-                    nn.Linear(hidden_state_dim, 2 * hidden_state_dim),
+                    nn.Linear(hidden_state_dim + conf_dim, 2 * hidden_state_dim),
                     nn.GELU(),
                     nn.Linear(2 * hidden_state_dim, 1024)  # Each expert produces full output
                 ) for _ in range(num_experts)
@@ -346,10 +346,10 @@ class ImportanceWeightedMoE(nn.Module):
 
 
 class CausalMaskGenerator(nn.Module):
-    def __init__(self, hidden_state_dim: int, code_dim: int, conf_dim: int,
-                 latent_dim: int, action_dim: int, hidden_dim=1024):
+    def __init__(self, hidden_state_dim: int, code_dim: int,
+                 hidden_dim=256):
         super().__init__()
-        self.total_feature_dim = latent_dim + action_dim
+        self.total_feature_dim = hidden_state_dim
 
         # Process code and confounder information
         self.code_encoder = nn.Sequential(
@@ -361,7 +361,7 @@ class CausalMaskGenerator(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, self.total_feature_dim),
-            nn.Sigmoid()  # COntinuous mask in [0, 1]
+            nn.Sigmoid()  # Continuous mask in [0, 1]
         )
 
         nn.init.orthogonal_(self.code_encoder[0].weight, gain=0.8)  # Orthogonal initialization with reduced gain
