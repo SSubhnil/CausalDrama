@@ -105,7 +105,7 @@ class StateModulator(nn.Module):
 
 
 class MoETransitionHead(nn.Module):
-    def __init__(self, hidden_state_dim, hidden_dim, code_dim, conf_dim, num_experts, top_k, codebook_data,
+    def __init__(self, hidden_state_dim, hidden_dim, code_dim, num_experts, top_k, codebook_data,
                  compute_inv_loss=False,
                  use_importance_weighted_moe=False, slicing=True, use_simple_mlp=False, importance_reg=0.01):
         super().__init__()
@@ -130,7 +130,7 @@ class MoETransitionHead(nn.Module):
         if self.use_simple_mlp:
             # Simple MLP that takes concatenated h and u inputs
             self.simple_mlp = nn.Sequential(
-                nn.Linear(hidden_state_dim + conf_dim, hidden_dim * 2),
+                nn.Linear(hidden_state_dim, hidden_dim * 2),
                 nn.SiLU(),
                 # nn.LayerNorm(hidden_dim * 2),
                 nn.Linear(hidden_dim * 2, hidden_dim * 2),
@@ -154,7 +154,6 @@ class MoETransitionHead(nn.Module):
                     hidden_state_dim=hidden_state_dim,
                     hidden_dim=hidden_dim,
                     code_dim=code_dim,
-                    conf_dim=conf_dim,
                     codebook_data=codebook_data,
                     slicing=slicing,
                     top_k=top_k,
@@ -169,20 +168,6 @@ class MoETransitionHead(nn.Module):
                                              top_k=self.top_k,
                                              )
 
-        # Confounding effect module
-        # self.conf_mask = nn.Parameter(torch.zeros(hidden_dim))
-        self.conf_mask = nn.Sequential(
-            nn.Linear(conf_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1024),  # Changed from hidden_dim to 1024
-            nn.Sigmoid()
-        )
-        self.f_conf = nn.Sequential(
-            nn.Linear(conf_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1024)  # Changed from hidden_dim to 1024
-        )
-
         # Final Projection layer to Next-state logits
         # Output from SparseCodebookMoE is a 1024 projection, but not logits
         self.final_proj = nn.Sequential(nn.Linear(1024, 1024 * 2),
@@ -192,28 +177,18 @@ class MoETransitionHead(nn.Module):
                                         # nn.Tanh()  # Maintains bounded outputs while allowing density learning
                                         )
 
-        """Replace with learnable sparsity mask"""
-        # Initialize sparse mask - may not be as flexible as a fully learable mask
-        # Initialize only the Linear layer's weights
-        nn.init.normal_(self.conf_mask[0].weight, std=0.01)
-        nn.init.zeros_(self.conf_mask[0].bias)  # Also initialize bias if needed
-        # Register hook on the Linear layer's weight parameter specifically
-        # self.conf_mask[0].weight.register_hook(lambda grad: grad * (torch.abs(grad) > 0.1).float())
-        # self.conf_mask[0].weight.register_hook(lambda grad: grad * torch.sigmoid(10 * torch.abs(grad)))
-        # More stable version lambda grad: grad * torch.clamp(torch.abs(grad), min=0.01, max=1.0)
-
     @profile
-    def forward(self, h, code_emb, u):
+    def forward(self, h, code_emb = None):
         # Get stable code embeddings
         code_emb_stable = code_emb  # .detach()
 
         # Integrate confounder with hidden state
         # Concatenate along feature dimension
-        combined = torch.cat([h, u], dim=-1)
+        # combined = torch.cat([h, u], dim=-1)
         # integrated_h = self.integration(combined)
         if self.use_simple_mlp:
             # Pass through the simple MLP
-            next_state_logits = self.simple_mlp(combined)
+            next_state_logits = self.simple_mlp(h)
 
             # Return dummy values for losses to match MoE return signature
             # These will be ignored in the loss computation if MLP mode is active
@@ -225,7 +200,7 @@ class MoETransitionHead(nn.Module):
         # integrated_h = integrated_h + h
         else:
             # Process through MoE
-            moe_out, aux_loss, diversity_loss, importance_stats = self.moe(combined, code_emb_stable)
+            moe_out, aux_loss, diversity_loss, importance_stats = self.moe(h, code_emb_stable)
             # moe_out = torch.clamp(moe_out, -100, 100)  # Add reasonable bounds
 
             # Create modulation input
@@ -339,14 +314,14 @@ class ImprovedRewardHead(RewardHead):
             nn.Linear(hidden_dim, 255)
         )
 
-    def forward(self, h_modulated, code_emb, q_re):
+    def forward(self, h, code_emb, q_re):
         """
         h_modulated: [B,T,D_w] - modulated state from transition head
         code_emb: [B,T,D_c] - quantized reward codes
         q_re: [B,T,K] - code weights
         """
         # Project modulated state to code space
-        state_proj = self.state_proj(h_modulated)
+        state_proj = self.state_proj(h)
 
         # Apply code alignment
         aligned_code_emb = self.code_align(code_emb)
@@ -362,7 +337,7 @@ class ImprovedRewardHead(RewardHead):
         fused_features = self.feature_fusion(fused_features)
 
         # Generate bin scaling (same as original)
-        scale = self.bin_scaler(h_modulated)
+        scale = self.bin_scaler(h)
         scaled_bins = self.bin_centers * scale
 
         # Final prediction
