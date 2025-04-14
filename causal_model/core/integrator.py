@@ -91,10 +91,7 @@ class CausalModel(nn.Module):
                                              normalize=self.quantizer_params.NormalizedInputs)
 
         self.mask_generator = CausalMaskGenerator(hidden_state_dim=self.hidden_state_dim,
-                                                  code_dim=self.code_dim_tr,
-                                                  conf_dim=self.confounder_params.ConfDim,
-                                                  latent_dim=self.stoch_dim,
-                                                  action_dim=self.action_dim,  # For 1D action after unsqueeze
+                                                  code_dim=self.code_dim_tr  # For 1D action after unsqueeze
                                                   )
 
     @profile
@@ -149,6 +146,7 @@ class CausalModel(nn.Module):
         Returns:
             InfoNCE loss for alignment
         """
+        code_emb = code_emb.detach()
         # 1. Sample windows from world model features using existing function
         B, T, D = dist_feat.shape
         M = code_emb.shape[1]  # Number of windows
