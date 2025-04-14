@@ -241,9 +241,9 @@ class DistHead(nn.Module):
         logits = self.unimix(logits, self.unimix_ratio)
         return logits
 
-    def forward_prior(self, h, code_emb_tr, u_post):
+    def forward_prior(self, h, code_emb_tr=None):
         # next_state_logits, h_modulated, total_tr_loss, aux_loss, sparsity_loss = self.tr_head(h, code_emb_tr, u_post)
-        logits, total_tr_loss, aux_loss, diversity_loss, sparsity_loss = self.prior_head(h, code_emb_tr, u_post)
+        logits, total_tr_loss, aux_loss, diversity_loss, sparsity_loss = self.prior_head(h, code_emb_tr)
         logits = rearrange(logits, "B L (K C) -> B L K C", K=self.stoch_dim)
         logits = self.unimix(logits, self.unimix_ratio)
         return logits, total_tr_loss, aux_loss, diversity_loss, sparsity_loss
@@ -423,14 +423,10 @@ class WorldModel(nn.Module):
         #     'tr_aux_loss': self.predictor_params.Transition.AuxiliaryWeight,
         #     'tr_sparsity_weight': self.predictor_params.Transition.MaskSparsityWeight
         # })
-        # self.state_modulator = StateModulator(self.hidden_state_dim, self.predictor_params.Transition.HiddenDim,
-        #                                       self.code_dim_tr, self.confounder_params.ConfDim,
-        #                                       self.predictor_params.ComputeInvarianceLoss)
 
         self.tr_head = MoETransitionHead(hidden_state_dim=self.hidden_state_dim,
                                          hidden_dim=self.predictor_params.Transition.HiddenDim,
                                          code_dim=self.code_dim_tr,
-                                         conf_dim=self.confounder_params.ConfDim,
                                          num_experts=self.predictor_params.Transition.NumOfExperts,
                                          top_k=self.predictor_params.Transition.TopK,
                                          codebook_data=codebook_data,
@@ -439,19 +435,19 @@ class WorldModel(nn.Module):
                                          use_simple_mlp=self.predictor_params.Transition.UseSimpleMLP
                                          )
 
-        self.re_head = ImprovedRewardHead(num_codes=self.num_codes_re,
-                                          code_dim=self.code_dim_re,
-                                          hidden_dim=self.predictor_params.Reward.HiddenDim,
-                                          hidden_state_dim=self.hidden_state_dim,
-                                          )
-
-        self.terminator = TerminationPredictor(hidden_state_dim=self.hidden_state_dim,
-                                               hidden_units=self.predictor_params.Termination.HiddenDim,
-                                               act=self.predictor_params.Termination.Activation,
-                                               layer_num=self.predictor_params.Termination.NumLayers,
-                                               dropout=self.predictor_params.Termination.Dropout,
-                                               dtype=config.Models.WorldModel.dtype,
-                                               device=self.device)
+        # self.re_head = ImprovedRewardHead(num_codes=self.num_codes_re,
+        #                                   code_dim=self.code_dim_re,
+        #                                   hidden_dim=self.predictor_params.Reward.HiddenDim,
+        #                                   hidden_state_dim=self.hidden_state_dim,
+        #                                   )
+        #
+        # self.terminator = TerminationPredictor(hidden_state_dim=self.hidden_state_dim,
+        #                                        hidden_units=self.predictor_params.Termination.HiddenDim,
+        #                                        act=self.predictor_params.Termination.Activation,
+        #                                        layer_num=self.predictor_params.Termination.NumLayers,
+        #                                        dropout=self.predictor_params.Termination.Dropout,
+        #                                        dtype=config.Models.WorldModel.dtype,
+        #                                        device=self.device)
 
         self.dist_head = DistHead(
             image_feat_dim=self.encoder.output_flatten_dim,
@@ -477,25 +473,25 @@ class WorldModel(nn.Module):
             dtype=config.Models.WorldModel.dtype, device=device
         )
 
-        self.reward_decoder = self.re_head
-        self.termination_decoder = self.terminator
-        # self.reward_decoder = RewardHead(
-        #     num_classes=255,
-        #     inp_dim=self.hidden_state_dim,
-        #     hidden_units=config.Models.WorldModel.Reward.HiddenUnits,
-        #     act=config.Models.WorldModel.Act,
-        #     layer_num=config.Models.WorldModel.Reward.LayerNum,
-        #     dtype=config.Models.WorldModel.dtype, device=device
-        # )
-        # self.reward_decoder.apply(weight_init)
-        # self.termination_decoder = TerminationHead(
-        #     inp_dim=self.hidden_state_dim,
-        #     hidden_units=config.Models.WorldModel.Termination.HiddenUnits,
-        #     act=config.Models.WorldModel.Act,
-        #     layer_num=config.Models.WorldModel.Termination.LayerNum,
-        #     dtype=config.Models.WorldModel.dtype, device=device
-        # )
-        # self.termination_decoder.apply(weight_init)
+        # self.reward_decoder = self.re_head
+        # self.termination_decoder = self.terminator
+        self.reward_decoder = RewardHead(
+            num_classes=255,
+            inp_dim=self.hidden_state_dim,
+            hidden_units=config.Models.WorldModel.Reward.HiddenUnits,
+            act=config.Models.WorldModel.Act,
+            layer_num=config.Models.WorldModel.Reward.LayerNum,
+            dtype=config.Models.WorldModel.dtype, device=device
+        )
+        self.reward_decoder.apply(weight_init)
+        self.termination_decoder = TerminationHead(
+            inp_dim=self.hidden_state_dim,
+            hidden_units=config.Models.WorldModel.Termination.HiddenUnits,
+            act=config.Models.WorldModel.Act,
+            layer_num=config.Models.WorldModel.Termination.LayerNum,
+            dtype=config.Models.WorldModel.dtype, device=device
+        )
+        self.termination_decoder.apply(weight_init)
         #
         self.mse_loss_func = MSELoss()
         self.ce_loss = nn.CrossEntropyLoss()
@@ -577,19 +573,22 @@ class WorldModel(nn.Module):
                 temporal_mask = get_subsequent_mask(latent)
                 dist_feat = self.sequence_model(latent, action, temporal_mask)
             else:
-                dist_feat = self.sequence_model(latent, action, inference_params)
+                tokens = self.sequence_model.backbone.tokenizer(latent, action)
+                quantizer_output, _ = self.causal_model(tokens, 1000, training=False)
+                feature_mask = self.causal_model.mask_generator(quantizer_output['quantized'])
+                tokens = tokens * feature_mask
+                dist_feat = self.sequence_model(tokens, inference_params)
 
             last_dist_feat = dist_feat[:, -1:]
-            action_unsqueezed = action.unsqueeze(-1)
-            combined_input = torch.cat([latent, action_unsqueezed, dist_feat], dim=-1)
+            # action_unsqueezed = action.unsqueeze(-1)
+            # combined_input = torch.cat([latent, action_unsqueezed, dist_feat], dim=-1)
             # Add causal model processing
-            quant_output_dict, u_post, _ = self.causal_model(combined_input, 1000)
+            # quant_output_dict, u_post, _ = self.causal_model(combined_input, 1000)
             # modulated_feat, _ = self.state_modulator(last_dist_feat, quant_output_dict['quantized_tr'],
             #                                                       u_post, 1000)
-            code_emb_tr = quant_output_dict['quantized_tr'][:, -1:]  # Get transition codes
-            u_post = u_post[:, -1:, :]  # Keep only the last timestep
+            # code_emb_tr = quant_output_dict['quantized'][:, -1:]  # Get transition codes
 
-            prior_logits, _, _, _, _ = self.dist_head.forward_prior(last_dist_feat, code_emb_tr, u_post)
+            prior_logits, _, _, _, _ = self.dist_head.forward_prior(last_dist_feat)
             prior_sample = self.straight_through_gradient(prior_logits, sample_mode="random_sample", identifier="522")
             prior_flattened_sample = self.flatten_sample(prior_sample)
             # Add this line to ensure consistent sequence dimensions
@@ -606,7 +605,8 @@ class WorldModel(nn.Module):
                 temporal_mask = get_subsequent_mask(latent)
                 dist_feat = self.sequence_model(latent, action, temporal_mask)
             else:
-                dist_feat = self.sequence_model(latent, action, inference_params)
+                tokens = self.sequence_model.backbone.tokenizer(latent, action)
+                dist_feat = self.sequence_model(tokens, inference_params)
             last_dist_feat = dist_feat[:, -1:]
             shifted_feat = last_dist_feat
             x = torch.cat((shifted_feat, flattened_sample), -1)
@@ -792,12 +792,17 @@ class WorldModel(nn.Module):
             decoding = inference_params.seqlen_offset > 0
 
             if not self.use_cg or not decoding:
-                hidden_state = self.sequence_model(
-                    samples, action,
-                    inference_params=inference_params,
+                tokens = self.sequence_model.backbone.tokenizer(samples, action)
+                quantizer_output, quant_loss = self.causal_model(tokens, global_step, training=False)
+                feature_mask = self.causal_model.mask_generator(quantizer_output['quantized'])
+                tokens = tokens * feature_mask
+                hidden_state = self.sequence_model(tokens, inference_params=inference_params)
+                # hidden_state = self.sequence_model(
+                #     samples, action,
+                #     inference_params=inference_params,
                     # num_last_tokens=1,
                     # ).logits.squeeze(dim=1)
-                )
+                # )
             else:
                 hidden_state = self.sequence_model._decoding_cache.run(
                     samples, action, inference_params.seqlen_offset
@@ -814,86 +819,50 @@ class WorldModel(nn.Module):
             return False
 
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp and not self.use_cg):
-            # Get hidden state from context
             context_dist_feat = get_hidden_state(context_latent, sample_action, inference_params)
             inference_params.seqlen_offset += context_dist_feat.shape[1]
-
-            # Store hidden state directly
-            self.dist_feat_buffer[:, 0:1] = context_dist_feat[:, -1:]
-            sample_action_unsqueezed = sample_action.unsqueeze(-1)
-
-            # Concat z, a, and h.
-            combined_input = torch.cat([context_latent, sample_action_unsqueezed, context_dist_feat], dim=-1)
-
-            # Process through causal model
-            # quantizer_output, u, _,  = self.causal_model(context_dist_feat, global_step)
-            quantizer_output, u, _, = self.causal_model(combined_input, global_step)
-
-            # Forward through transition head directly without modulation
-            context_prior_logits, _, _, _, _ = self.dist_head.forward_prior(context_dist_feat,
-                                                                            quantizer_output['quantized_tr'], u)
-
-            # Get next state prediction
-            context_prior_sample = self.straight_through_gradient(context_prior_logits, logger=logger,
-                                                                  global_step=global_step,
-                                                                  identifier='context_prior')
+            context_prior_logits = self.dist_head.forward_prior(context_dist_feat)
+            context_prior_sample = self.stright_throught_gradient(context_prior_logits)
             context_flattened_sample = self.flatten_sample(context_prior_sample)
 
-            # Initialize lists for tracking states and actions
             dist_feat_list, sample_list = [context_dist_feat[:, -1:]], [context_flattened_sample[:, -1:]]
             self.sample_buffer[:, 0:1] = context_flattened_sample[:, -1:]
             self.dist_feat_buffer[:, 0:1] = context_dist_feat[:, -1:]
             action_list, old_logits_list = [], []
-
             i = 0
             while not should_stop(sample_list[-1], inference_params):
-                # Sample action from agent
                 action, logits = agent.sample(
                     torch.cat([self.sample_buffer[:, i:i + 1], self.dist_feat_buffer[:, i:i + 1]], dim=-1))
                 action_list.append(action)
                 self.action_buffer[:, i:i + 1] = action
                 old_logits_list.append(logits)
-                # Get new hidden state
                 dist_feat = get_hidden_state(sample_list[-1], action_list[-1], inference_params)
-                action_list_unsqueezed = action_list[-1].unsqueeze(-1)
-                # Combine z, a and h
-                combined_input_1 = torch.cat([sample_list[-1], action_list_unsqueezed, dist_feat], dim=-1)
-                # Process through causal model
-                # quantizer_output_x, u_x, _ = self.causal_model(dist_feat, global_step)
-                quantizer_output_x, u_x, _ = self.causal_model(combined_input_1, global_step)
-                # Store hidden state directly
                 dist_feat_list.append(dist_feat)
-                self.dist_feat_buffer[:, i + 1:i + 2] = dist_feat[:, -1:, :]
-                # Update inference params
+                self.dist_feat_buffer[:, i + 1:i + 2] = dist_feat
                 inference_params.seqlen_offset += sample_list[-1].shape[1]
-                # Predict next state with transition head
-                prior_logits, _, _, _, _ = self.dist_head.forward_prior(dist_feat, quantizer_output_x['quantized_tr'],
-                                                                        u_x)
-
-                prior_sample = self.straight_through_gradient(prior_logits, logger=logger, global_step=global_step,
-                                                              identifier='prior_logits')
+                # if repetition_penalty == 1.0:
+                #     sampled_tokens = sample_tokens(scores[-1], inference_params)
+                # else:
+                #     logits = modify_logit_for_repetition_penalty(
+                #         scores[-1].clone(), sequences_cat, repetition_penalty
+                #     )
+                #     sampled_tokens = sample_tokens(logits, inference_params)
+                #     sequences_cat = torch.cat([sequences_cat, sampled_tokens], dim=1)
+                prior_logits = self.dist_head.forward_prior(dist_feat_list[-1])
+                prior_sample = self.stright_throught_gradient(prior_logits)
                 prior_flattened_sample = self.flatten_sample(prior_sample)
                 sample_list.append(prior_flattened_sample)
                 self.sample_buffer[:, i + 1:i + 2] = prior_flattened_sample
                 i += 1
 
-            # Combine gathered logits
+            # sample_tensor = torch.cat(sample_list, dim=1)
+            # dist_feat_tensor = torch.cat(dist_feat_list, dim=1)
+            # action_tensor = torch.cat(action_list, dim=1)
             old_logits_tensor = torch.cat(old_logits_list, dim=1)
-            # Process the entire sequence for reward and termination predictions
-            trajectory_dist_feat = self.dist_feat_buffer[:, :-1]
-            trajectory_samples = self.sample_buffer[:, :-1]  # Get stored flattened samples
-            trajectory_actions = self.action_buffer  # Get stored actions
-            trajectory_actions_unsqueezed = trajectory_actions.unsqueeze(-1)
-            combined_trajectory_input = torch.cat(
-                [trajectory_samples, trajectory_actions_unsqueezed, trajectory_dist_feat], dim=-1)
 
-            quantizer_output_re, u_re, _ = self.causal_model(combined_trajectory_input, global_step)
-            # Reward prediction directly using hidden states
-            reward_hat_tensor, _ = self.reward_decoder(trajectory_dist_feat, quantizer_output_re['quantized_re'],
-                                                       quantizer_output_re['q_re'])
+            reward_hat_tensor = self.reward_decoder(self.dist_feat_buffer[:, :-1])
             self.reward_hat_buffer = self.symlog_twohot_loss_func.decode(reward_hat_tensor)
-            # Termination prediction
-            termination_hat_tensor = self.termination_decoder(trajectory_dist_feat)
+            termination_hat_tensor = self.termination_decoder(self.dist_feat_buffer[:, :-1])
             self.termination_hat_buffer = termination_hat_tensor > 0
 
         if log_video:
@@ -931,43 +900,46 @@ class WorldModel(nn.Module):
                 temporal_mask = get_subsequent_mask_with_batch_length(batch_length, flattened_sample.device)
                 dist_feat = self.sequence_model(flattened_sample, action, temporal_mask)
             else:
-                dist_feat = self.sequence_model(flattened_sample, action)
+                # dist_feat = self.sequence_model(flattened_sample, action)
+                tokens = self.sequence_model.backbone.tokenizer(flattened_sample, action)
+                quantizer_output, quant_loss = self.causal_model(tokens, global_step, training=True)
+                feature_mask = self.causal_model.mask_generator(quantizer_output['quantized'])
+                tokens = tokens * feature_mask
+                dist_feat = self.sequence_model(tokens)
 
-            action_unsqueezed = action.unsqueeze(-1)  # Reshape from [16, 128] to [16, 128, 1]
+            # Contrastive losses
+            code_contrastive_loss = self.causal_model.quantizer.info_nce_contrastive_loss(quantizer_output['quantized'])
+            causal_world_contrastive_loss = self.world_causal_alignment_loss(dist_feat, quantizer_output['quantized'], temperature=0.1)
 
-            combined_input = torch.cat([flattened_sample.detach(), action_unsqueezed.detach(), dist_feat.detach()],
-                                       dim=-1)
-
-            # 1. Pass the dist_feat to the causal model encoder -> quantizer -> confounding
-            quantizer_output, u_post, causal_loss, quant_loss, prior_loss, post_loss = self.causal_model(
-                combined_input, global_step, training=True)
-            # STATE MODULATOR has bidirection gradient flow
-            # Allow gradients form modulator to causal model
-            # mod_dist_feat, inv_loss = self.state_modulator(dist_feat,
-            #                                                 quantizer_output['quantized_tr'].detach(),
-            #                                                 u_post.detach(), global_step)
+            contrastive_loss = 0.3 * code_contrastive_loss
             # PREDICTION HEADS (with directed gradient flow)
             # For transition prediction - aloow gradients to modulator but not to causal model internals
             prior_logits, total_tr_loss, aux_loss, diversity_loss, sparsity_loss = self.dist_head.forward_prior(
                 dist_feat,
-                quantizer_output['quantized_tr'],  # Detach codes
-                u_post)  # Detach posterior
+                #quantizer_output['quantized']
+            )
             if self.tr_head.use_importance_weighted_moe:
                 self.dist_head.update_temperature()  # Update MoE temperature
             # decoding reward and termination with dist_feat
-            reward_hat, re_head_loss = self.reward_decoder(dist_feat,
-                                                           quantizer_output['quantized_re'],
-                                                           quantizer_output['q_re'])
+            # reward_hat, re_head_loss = self.reward_decoder(dist_feat,
+                                                           # quantizer_output['quantized_re'],
+                                                           # quantizer_output['q_re']
+                                                           # )
+
             pred_loss = 0.01 * aux_loss + 0.05 * sparsity_loss + 0.2 * diversity_loss
 
             # Common loss calculations
-            reward_decoded = self.symlog_twohot_loss_func.decode(reward_hat)  # Convert to scalar values
+            # reward_decoded = self.symlog_twohot_loss_func.decode(reward_hat)  # Convert to scalar values
+            # termination_hat = self.termination_decoder(dist_feat)
+
+            # decoding reward and termination with dist_feat
+            reward_hat = self.reward_decoder(dist_feat)
             termination_hat = self.termination_decoder(dist_feat)
 
             """Model losses from causal model"""
             # env loss
             reconstruction_loss = self.mse_loss_func(obs_hat[:batch_size], obs[:batch_size])
-            reward_loss = F.mse_loss(reward_decoded, symlog(reward))
+            reward_loss = F.mse_loss(reward_hat, symlog(reward))
             termination_loss = self.bce_with_logits_loss_func(termination_hat, termination)
             # dyn-rep loss
             # pred_loss = (self.loss_weights['tr_aux_loss'] * aux_loss) + (
@@ -979,9 +951,10 @@ class WorldModel(nn.Module):
                                                                                            :-1].detach())
             # Separate world model losses from causal model losses
             # Added a dynamics loss weight 0.8
-            prediction_head_loss = pred_loss + re_head_loss
-            world_model_loss = reconstruction_loss + reward_loss + termination_loss + dynamics_loss + 0.1 * representation_loss + prediction_head_loss
-            causal_model_loss = causal_loss
+            prediction_head_loss = pred_loss
+            world_model_loss = reconstruction_loss + reward_loss + termination_loss + dynamics_loss + \
+                               0.1 * representation_loss + prediction_head_loss + 0.4 * causal_world_contrastive_loss
+            causal_model_loss = quant_loss + contrastive_loss
             # total_loss = reconstruction_loss + reward_loss + termination_loss + dynamics_loss + 0.1 * representation_loss + causal_loss + pred_loss + re_head_loss
 
             # First backward for world model
@@ -1034,5 +1007,78 @@ class WorldModel(nn.Module):
 
         return reconstruction_loss.item(), reward_loss.item(), termination_loss.item(), \
             dynamics_loss.item(), dynamics_real_kl_div.item(), representation_loss.item(), \
-            representation_real_kl_div.item(), quant_loss.item(), post_loss.item(), prior_loss.item(), causal_model_loss.item(), world_model_loss.item()
+            representation_real_kl_div.item(), quant_loss.item(), causal_model_loss.item(), world_model_loss.item()
 
+    def world_causal_alignment_loss(self, dist_feat, code_emb, temperature=0.1):
+        """
+        Implements InfoNCE contrastive loss to align world model hidden states
+        with causal model trajectory codes using windowed trajectories
+
+        Args:
+            dist_feat: Features from world model sequence [B, T, hidden_dim]
+            code_emb: Code embeddings from causal model [B, M, code_dim]
+                     (already arranged as batch x windows x features)
+            temperature: Temperature parameter for softmax
+
+        Returns:
+            InfoNCE loss for alignment
+        """
+        code_emb = code_emb.detach()
+        # 1. Sample windows from world model features using existing function
+        B, T, D = dist_feat.shape
+        M = code_emb.shape[1]  # Number of windows
+
+        # Use the existing sample_windows function
+        windowed_features = self.sample_windows(dist_feat)  # [B*M, W, D]
+
+        # 2. For each window, use the final state as the representation
+        window_features = windowed_features[:, -1, :]  # [B*M, D]
+
+        # 3. Project to common space if dimensions differ
+        if hasattr(self, 'alignment_projector'):
+            window_features = self.alignment_projector(window_features)
+
+        # 4. Reshape window features to match code_emb shape
+        window_features = window_features.reshape(B, M, -1)  # [B, M, D]
+
+        # 5. Compute InfoNCE loss for each window position
+        total_loss = 0
+        for m in range(M):
+            # Get features and codes for this window position
+            win_feat = window_features[:, m, :]  # [B, D]
+            win_code = code_emb[:, m, :]  # [B, code_dim]
+
+            # Normalize for cosine similarity
+            win_feat_norm = F.normalize(win_feat, p=2, dim=1)
+            win_code_norm = F.normalize(win_code, p=2, dim=1)
+
+            # Compute similarity matrix
+            similarity = torch.mm(win_feat_norm, win_code_norm.t()) / temperature  # [B, B]
+
+            # InfoNCE loss - positives are along diagonal
+            labels = torch.arange(B, device=dist_feat.device)
+            loss = F.cross_entropy(similarity, labels)
+            total_loss += loss
+
+        return total_loss / M  # Average across windows
+
+    def sample_windows(self, trajectory):
+        """Sample fixed-size windows from a trajectory"""
+        B, L, D = trajectory.shape
+
+        # Calculate stride to evenly cover the trajectory
+        if self.stride is None:
+            if L <= self.window_size:
+                stride = 1
+            else:
+                stride = max(1, (L - self.window_size) // (self.num_windows - 1))
+        else:
+            stride = self.stride
+
+        windows = []
+        for i in range(self.num_windows):
+            start_idx = min(i * stride, max(0, L - self.window_size))
+            windows.append(trajectory[:, start_idx:start_idx + self.window_size])
+
+        # Stack along batch dimension to process as independent trajectories
+        return torch.cat(windows, dim=0)  # [B*M, W, D]
