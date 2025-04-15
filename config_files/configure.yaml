@@ -3,7 +3,7 @@ BasicSettings:
   ImageChannel: 3
   ReplayBufferOnGPU: True
   Seed: 3710
-  Env_name: ALE/DemonAttack-v5
+  Env_name: ALE/Pong-v5
   Device: cuda:0
   Use_amp: True
   Use_cg: True
@@ -116,14 +116,13 @@ Models:
     UseConfounder: False      # Flag to use confounder encoder and approximator
 
     Encoder:                  # Avoid bottlenecking -> hidden_dim == hidden_state_dim
-      Embedding: continuous   # projection / continuous/ discrete(WIP)
+      Embedding: projection   # projection / continuous/ discrete(WIP)
       TransProjDim: 512       # %%%%% Should be same as TrCodeDim
       RewProjDim: 512         # %%%%% Should be same as ReCodeDim
-      HiddenDim: 2048          # Hidden layer dimensions
+      HiddenDim: 512          # Hidden layer dimensions
       Activation: SiLU        # Activation function
       NumWindows: 16          # For windowed trajectories
       WindowSize: 16          # Size of mini-trajectories
-      Stride: None            # Stride to evenly cover the trajectory space with CNN
 
     Quantizer:
       TransitionTemp: 1.0     # Initial Gumbel softmax temp for transition codebook
@@ -138,6 +137,8 @@ Models:
       Coupling: False          # Enable codebook coupling
       SparsityWeight: 0.1     # Sparsity Loss for coupling
       LambdaCouple: 0.1       # Coupling loss weight
+      ContrastiveLossWeight: 0.3  # Weight for pre-quantization contrastive loss
+      CausalWorldContrastiveLossWeight: 0.4  # Weight for InfoNCE between world model output and codes.
       UseCDist: False
 
     Confounder:
@@ -169,8 +170,8 @@ Models:
       RewardWeight: 1.0         # Main objective - reward prediction
       TerminationWeight: 0.5    # Secondary Objective - episode termination
       Transition:
-        UseSimpleMLP: False      # Used instead of MoE
-        UseImportanceWeightedMoE: True
+        UseSimpleMLP: True      # Used instead of MoE
+        UseImportanceWeightedMoE: False
         Slicing: True        # Experts predict over sliced next-state logits
         NumOfExperts: 4      # 4, 8, 16, 32
         TopK: 3              # Redundant
