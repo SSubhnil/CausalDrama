@@ -69,8 +69,8 @@ def train_world_model_step(replay_buffer: ReplayBuffer, world_model: WorldModel,
     epoch_representation_loss_list = []
     epoch_representation_real_kl_div_list = []
     epoch_quant_loss_list = []
-    epoch_post_loss_list = []
-    epoch_prior_loss_list = []
+    epoch_contrastive_loss = []
+    epoch_causal_world_loss = []
     epoch_causal_loss_list = []
     epoch_world_loss_list = []
 
@@ -78,7 +78,7 @@ def train_world_model_step(replay_buffer: ReplayBuffer, world_model: WorldModel,
         obs, action, reward, termination = replay_buffer.sample(batch_size, batch_length, imagine=False)
         reconstruction_loss, reward_loss, termination_loss, \
             dynamics_loss, dynamics_real_kl_div, representation_loss, \
-            representation_real_kl_div, quant_loss, post_loss, prior_loss, causal_model_loss, world_model_loss = world_model.update(
+            representation_real_kl_div, quant_loss, code_contrastive_loss, causal_world_loss, causal_model_loss, world_model_loss = world_model.update(
             obs, action, reward, termination,
             global_step=global_step, epoch_step=e,
             logger=logger)
@@ -91,8 +91,8 @@ def train_world_model_step(replay_buffer: ReplayBuffer, world_model: WorldModel,
         epoch_representation_loss_list.append(representation_loss)
         epoch_representation_real_kl_div_list.append(representation_real_kl_div)
         epoch_quant_loss_list.append(quant_loss)
-        epoch_prior_loss_list.append(prior_loss)
-        epoch_post_loss_list.append(post_loss)
+        epoch_contrastive_loss.append(code_contrastive_loss)
+        epoch_causal_world_loss.append(causal_world_loss)
         epoch_causal_loss_list.append(causal_model_loss)
         epoch_world_loss_list.append(world_model_loss)
     if logger is not None:
@@ -106,8 +106,8 @@ def train_world_model_step(replay_buffer: ReplayBuffer, world_model: WorldModel,
         logger.log("WorldModel/representation_real_kl_div", np.mean(epoch_representation_real_kl_div_list),
                    global_step=global_step)
         logger.log("WorldModel/quant_loss", np.mean(epoch_quant_loss_list), global_step=global_step)
-        logger.log("WorldModel/prior_loss", np.mean(epoch_prior_loss_list), global_step=global_step)
-        logger.log("WorldModel/posterior_loss", np.mean(epoch_post_loss_list), global_step=global_step)
+        logger.log("WorldModel/code_contra_loss", np.mean(epoch_contrastive_loss), global_step=global_step)
+        logger.log("WorldModel/CM_WM_contra_loss", np.mean(epoch_causal_world_loss), global_step=global_step)
         logger.log("WorldModel/causal_model_loss", np.mean(epoch_causal_loss_list), global_step=global_step)
         logger.log("WorldModel/world_model_loss", np.mean(epoch_world_loss_list), global_step=global_step)
 
@@ -142,6 +142,56 @@ def world_model_imagine_data(replay_buffer: ReplayBuffer,
             logger=logger, global_step=global_step
         )
     return latent, action, old_logits, context_latent, sample_reward, sample_termination, reward_hat, termination_hat
+
+
+def offline_train_world_model(config, logdir, replay_buffer: ReplayBuffer, world_model: WorldModel, logger):
+    """
+    Train the world model using an offline dataset stored in the replay buffer.
+    """
+    os.makedirs(f"{logdir}/ckpt", exist_ok=True)
+
+    print("Starting offline training of the world model...")
+
+    # Training loop
+    for total_steps in tqdm(range(config.OfflineTraining.MaxSteps), desc="Offline Training"):
+        # Sample a batch from the replay buffer
+        if replay_buffer.ready('world_model'):
+            obs, action, reward, termination = replay_buffer.sample(
+                batch_size=config.OfflineTraining.BatchSize,
+                batch_length=config.OfflineTraining.BatchLength,
+                imagine=False
+            )
+
+            # Train the world model on the sampled batch
+            reconstruction_loss, reward_loss, termination_loss, \
+                dynamics_loss, dynamics_real_kl_div, representation_loss, \
+                representation_real_kl_div, quant_loss, post_loss, prior_loss, \
+                causal_model_loss, world_model_loss = world_model.update(
+                obs=obs,
+                action=action,
+                reward=reward,
+                termination=termination,
+                global_step=total_steps,
+                epoch_step=0,
+                logger=logger
+            )
+
+            # Log losses
+            if logger is not None:
+                logger.log("WorldModel/reconstruction_loss", reconstruction_loss, global_step=total_steps)
+                logger.log("WorldModel/reward_loss", reward_loss, global_step=total_steps)
+                logger.log("WorldModel/termination_loss", termination_loss, global_step=total_steps)
+                logger.log("WorldModel/dynamics_loss", dynamics_loss, global_step=total_steps)
+                logger.log("WorldModel/representation_loss", representation_loss, global_step=total_steps)
+                logger.log("WorldModel/causal_model_loss", causal_model_loss, global_step=total_steps)
+                logger.log("WorldModel/world_model_loss", world_model_loss, global_step=total_steps)
+
+        # Save model checkpoints periodically
+        if total_steps % config.OfflineTraining.SaveEverySteps == 0:
+            print(f"Saving world model checkpoint at step {total_steps}")
+            torch.save(world_model.state_dict(), f"{logdir}/ckpt/world_model_{total_steps}.pth")
+
+    print("Offline training completed.")
 
 
 def joint_train_world_model_agent(config, logdir,
