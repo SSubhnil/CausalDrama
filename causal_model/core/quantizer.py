@@ -322,6 +322,81 @@ class TrajectoryQuantizer(nn.Module):
 
         return loss
 
+    def trajectory_contrastive_loss(self, encoded_trajectories, previous_code_assignments=None, temperature=0.1, top_k=5):
+        """
+        InfoNCE contrastive loss that groups trajectories from similar contexts
+        based on quantized code assignments from previous updates.
+
+        Args:
+            encoded_trajectories: Current trajectory embeddings [B, embedding_dim]
+            previous_code_assignments: Soft code assignments from previous update [B, num_codes]
+                                      (typically quantizer_output['q'] from previous batch)
+            temperature: Controls sharpness of similarity distribution
+            top_k: Number of positive examples to use per anchor
+
+        Returns:
+            InfoNCE contrastive loss
+        """
+        batch_size = encoded_trajectories.shape[0]
+        device = encoded_trajectories.device
+
+        # Normalize trajectory embeddings for cosine similarity
+        normalized_trajectories = F.normalize(encoded_trajectories, p=2, dim=1)
+
+        # Compute similarity matrix between all trajectories
+        sim_matrix = torch.mm(normalized_trajectories, normalized_trajectories.t()) / temperature
+
+        # Identity mask to exclude self-similarity
+        identity_mask = torch.eye(batch_size, device=device)
+
+        # If we have previous code assignments, use them to define positive pairs
+        if previous_code_assignments is not None:
+            # Compute similarity between code assignments
+            # Higher values mean trajectories likely share the same context
+            code_similarity = torch.mm(previous_code_assignments, previous_code_assignments.t())
+
+            # Remove self-similarity from consideration
+            code_similarity = code_similarity * (1 - identity_mask)
+
+            # Get top-k similar trajectories for each anchor based on code assignments
+            k = min(batch_size - 1, top_k)
+            _, topk_indices = torch.topk(code_similarity, k, dim=1)
+
+            # Create positive mask where positive_mask[i,j]=1 if j is a positive for i
+            positive_mask = torch.zeros_like(sim_matrix, device=device)
+            positive_mask.scatter_(1, topk_indices, 1.0)
+        else:
+            # On first iteration, fallback to standard InfoNCE
+            # Each trajectory is its own positive example
+            positive_mask = identity_mask
+
+        # Compute log(exp(sim_pos) / sum_j(exp(sim_j))) for InfoNCE
+        # First, mask the similarity matrix to exclude non-positives
+        masked_sim = sim_matrix.masked_fill(positive_mask == 0, -1e9)
+
+        # Also exclude self from positive similarities for better learning
+        masked_sim = masked_sim.masked_fill(identity_mask == 1, -1e9)
+
+        # For denominator, exclude self but keep all other trajectories
+        sim_matrix_no_self = sim_matrix.masked_fill(identity_mask == 1, -1e9)
+
+        # Compute log numerator and denominator
+        log_numerator = torch.logsumexp(masked_sim, dim=1)  # [B]
+        log_denominator = torch.logsumexp(sim_matrix_no_self, dim=1)  # [B]
+
+        # For anchors with valid positives, compute InfoNCE loss
+        valid_anchors = torch.sum(positive_mask, dim=1) > 0
+
+        if valid_anchors.sum() > 0:
+            # InfoNCE loss: -log[sum_pos(exp(sim))/sum_all(exp(sim))]
+            loss = (log_denominator - log_numerator)[valid_anchors].mean()
+        else:
+            # Fallback for cases with no valid anchors
+            labels = torch.arange(batch_size, device=device)
+            loss = F.cross_entropy(sim_matrix, labels)
+
+        return loss
+
     def anneal_temperature(self, epoch):
         """Delegate temperature annealing to underlying VQQuantizer"""
         self.vq.set_temperature(max(
