@@ -3,6 +3,7 @@ import torch.nn as nn
 from sentry_sdk.utils import epoch
 from torch.nn.init import kaiming_normal_
 import torch.nn.functional as F
+import math
 
 
 class MLP(nn.Module):
@@ -130,7 +131,7 @@ class SparseCodebookMoE(nn.Module):
 
 
 class ImportanceWeightedMoE(nn.Module):
-    def __init__(self, num_experts, hidden_state_dim, hidden_dim, code_dim, conf_dim, codebook_data, slicing=True,
+    def __init__(self, num_experts, hidden_state_dim, hidden_dim, code_dim, codebook_data, slicing=True,
                  top_k=2,
                  importance_reg=0.01):
         super().__init__()
@@ -145,7 +146,6 @@ class ImportanceWeightedMoE(nn.Module):
         # Store the actual value
         self.num_experts = safe_num_experts
         self.hidden_state_dim = hidden_state_dim
-        self.conf_dim = conf_dim
         self.slicing = slicing
 
         # Initialize with existing code anchors up to safe_num_experts
@@ -375,7 +375,7 @@ class CausalMaskGenerator(nn.Module):
             # Use Kaiming initialization with fan_out for intermediate layers
             for m in self.mask_generator[:-2]:
                 if isinstance(m, nn.Linear):
-                    nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='silu')
+                    nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu', a=0.1)
 
         # Initialize temperature parameter for controlling mask discreteness
         self.register_buffer('temperature', torch.tensor(1.0))
@@ -417,3 +417,84 @@ class CausalMaskGenerator(nn.Module):
             mask = mask_logits
 
         return mask
+
+
+class MultiResolutionMaskGenerator(nn.Module):
+    def __init__(self, hidden_state_dim, code_dim):
+        super().__init__()
+        self.code_projection = nn.Linear(code_dim, hidden_state_dim)
+        self.query_projection = nn.Linear(hidden_state_dim, hidden_state_dim)
+        self.key_projection = nn.Linear(hidden_state_dim, hidden_state_dim)
+
+        # Feature gate for generating masks
+        self.feature_gate = nn.Sequential(
+            nn.Linear(hidden_state_dim, hidden_state_dim),
+            nn.Sigmoid()
+        )
+
+        # Initialize weights for full throughput
+        self._initialize_weights()
+
+        # Temperature for controlling mask sharpness
+        self.register_buffer('temperature', torch.tensor(1.0))
+        self.register_buffer('min_temperature', torch.tensor(0.1))
+        self.register_buffer('temperature_decay', torch.tensor(0.999))
+
+    def _initialize_weights(self):
+        """Initialize weights for full throughput."""
+        # Initialize code projection layers
+        nn.init.kaiming_normal_(self.code_projection.weight, mode='fan_out', nonlinearity='relu')
+        nn.init.zeros_(self.code_projection.bias)
+
+        nn.init.kaiming_normal_(self.query_projection.weight, mode='fan_out', nonlinearity='relu')
+        nn.init.zeros_(self.query_projection.bias)
+
+        nn.init.kaiming_normal_(self.key_projection.weight, mode='fan_out', nonlinearity='relu')
+        nn.init.zeros_(self.key_projection.bias)
+
+        # Initialize feature gate layers for full throughput
+        final_layer = self.feature_gate[0]
+        nn.init.constant_(final_layer.weight, 0.01)  # Small weights
+        nn.init.constant_(final_layer.bias, 3.0)  # Sigmoid(3.0) ≈ 0.95 (close to full throughput)
+
+    def anneal_temperature(self):
+        """Anneal temperature for sharper masks."""
+        self.temperature = max(self.min_temperature.item(), self.temperature.item() * self.temperature_decay.item())
+
+    def forward(self, quantized_codes, tokens):
+        """
+        Args:
+            quantized_codes: [B, M, code_dim] - Context vectors from causal model
+            tokens: [B, T, hidden_state_dim] - Hidden state or token representations
+
+        Returns:
+            feature_mask: [B, T, hidden_state_dim] - Generated mask for token dimensions
+        """
+        B, M, C = quantized_codes.shape
+        _, T, D = tokens.shape
+
+        # Project code embeddings to match token dimensions
+        codes_projected = self.code_projection(quantized_codes)  # [B, M, D]
+
+        # Create attention mechanism
+        queries = self.query_projection(tokens)  # [B, T, D]
+        keys = self.key_projection(codes_projected)  # [B, M, D]
+
+        # Compute attention scores
+        attention = torch.bmm(queries, keys.transpose(1, 2))  # [B, T, M]
+
+        # Apply temperature scaling
+        attention = F.softmax(attention / math.sqrt(D), dim=-1)
+
+        # Use attention to create weighted sum of code embeddings
+        context_per_token = torch.bmm(attention, codes_projected)  # [B, T, D]
+
+        # Generate feature mask from context embeddings
+        mask_logits = self.feature_gate(context_per_token)  # [B, T, D]
+
+        if self.temperature != 1.0:
+            feature_mask = torch.sigmoid(mask_logits / self.temperature)
+        else:
+            feature_mask = mask_logits
+
+        return feature_mask
