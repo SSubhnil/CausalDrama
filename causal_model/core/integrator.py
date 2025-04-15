@@ -5,7 +5,7 @@ import time
 from line_profiler import profile
 from .encoder import CausalEncoder, ConvolutionalTrajectoryEncoder
 from .quantizer import DualVQQuantizer, TrajectoryQuantizer
-from .networks import CausalMaskGenerator
+from .networks import CausalMaskGenerator, MultiResolutionMaskGenerator
 
 
 class CausalModel(nn.Module):
@@ -23,10 +23,10 @@ class CausalModel(nn.Module):
         self.use_confounder = params.Models.CausalModel.UseConfounder
 
         combined_input_dim = self.hidden_state_dim
-        if action_dim is not None:
-            combined_input_dim += 1  # For 1D action after unsqueeze
-        if stoch_dim is not None:
-            combined_input_dim += stoch_dim
+        # if action_dim is not None:
+        #     combined_input_dim += 1  # For 1D action after unsqueeze
+        # if stoch_dim is not None:
+        #     combined_input_dim += stoch_dim
 
         self.loss_weights = {
             # Primary Prediction Losses
@@ -48,11 +48,11 @@ class CausalModel(nn.Module):
         self.causal_encoder = ConvolutionalTrajectoryEncoder(input_dim=combined_input_dim,
                                                              hidden_dim=self.encoder_params.HiddenDim,
                                                              projection_dim=self.encoder_params.TransProjDim,
+                                                             device=self.device,
                                                              embedding_mode=self.encoder_params.Embedding)
         # For mini-trajectories or windowed
         self.num_windows = self.encoder_params.NumWindows
         self.window_size = self.encoder_params.WindowSize
-        self.stride = self.encoder_params.Stride
         """
         QUANTIZER
         Losses:
@@ -82,7 +82,7 @@ class CausalModel(nn.Module):
         #                                  hidden_dim=self.hidden_dim,
         #                                  use_cdist=self.quantizer_params.UseCDist
         #                                  )
-
+        self.contrastive_loss_weight = self.quantizer_params.ContrastiveLossWeight
         self.quantizer = TrajectoryQuantizer(num_codes=self.num_codes_tr,
                                              code_dim=self.code_dim_tr,
                                              beta=self.quantizer_params.BetaTransition,
@@ -90,7 +90,7 @@ class CausalModel(nn.Module):
                                              use_cdist=self.quantizer_params.UseCDist,
                                              normalize=self.quantizer_params.NormalizedInputs)
 
-        self.mask_generator = CausalMaskGenerator(hidden_state_dim=self.hidden_state_dim,
+        self.mask_generator = MultiResolutionMaskGenerator(hidden_state_dim=self.hidden_state_dim,
                                                   code_dim=self.code_dim_tr  # For 1D action after unsqueeze
                                                   )
 
@@ -104,8 +104,26 @@ class CausalModel(nn.Module):
         # 2. Encode each window as an independent trajectory
         encoded_windows = self.causal_encoder(windowed_trajectories)  # [B*M, code_dim]
 
+        # Initialize contrastive loss
+        contrastive_loss = None
+
+        if training:
+            if not hasattr(self, 'previous_code_assignments'):
+                self.previous_code_assignments = None
+
+            # Calculate contrastive loss on encoded trajectories
+            contrastive_loss = self.trajectory_contrastive_loss(encoded_windows,
+                                                                self.previous_code_assignments)
+
+
         # 3. Quantize the encoded windows
-        quantizer_output, quant_loss = self.quantizer(encoded_windows, global_step, training)
+        quantizer_output = self.quantizer(encoded_windows, training)
+        quant_loss = quantizer_output['loss']
+
+        # Store current code assignments for next iterations
+        if training and 'q' in quantizer_output:
+            # Detach to prevent backprop through previous iterations
+            self.previous_code_assignments = quantizer_output['q'].detach()
 
         # 4. Reshape outputs to separate batch and window dimensions
         B = h.shape[0]
@@ -126,8 +144,14 @@ class CausalModel(nn.Module):
 
         # Different paths for training and inference
         if training:
+            if contrastive_loss is not None:
+                reshaped_output['contrastive_loss'] = contrastive_loss
+                # combine losses if in training mode
+                total_loss = quant_loss + self.contrastive_loss_weight * contrastive_loss
+            else:
+                total_loss = quant_loss
             self.anneal_quantizer_temperature(global_step)
-            return reshaped_output, quant_loss
+            return reshaped_output, total_loss
 
         else:  # Inference
             return reshaped_output, None
@@ -189,14 +213,15 @@ class CausalModel(nn.Module):
         """Sample fixed-size windows from a trajectory"""
         B, L, D = trajectory.shape
 
-        # Calculate stride to evenly cover the trajectory
-        if self.stride is None:
-            if L <= self.window_size:
-                stride = 1
-            else:
-                stride = max(1, (L - self.window_size) // (self.num_windows - 1))
-        else:
-            stride = self.stride
+        # # Calculate stride to evenly cover the trajectory
+        # if self.stride is None:
+        #     if L <= self.window_size:
+        #         stride = 1
+        #     else:
+        #         stride = max(1, (L - self.window_size) // (self.num_windows - 1))
+        # else:
+        #     stride = self.stride
+        stride = max(1, (L - self.window_size) // (self.num_windows - 1))
 
         windows = []
         for i in range(self.num_windows):
