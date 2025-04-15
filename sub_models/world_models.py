@@ -411,13 +411,14 @@ class WorldModel(nn.Module):
             stoch_dim=self.stoch_flattened_dim,
             d_model=self.hidden_state_dim
         )
-        codebook_data = self.causal_model.quantizer.tr_quantizer.codebook.data.clone()
-
+        # codebook_data = self.causal_model.quantizer.tr_quantizer.codebook.data.clone()
+        codebook_data = self.causal_model.quantizer.vq.codebook.data.clone()
         """
         PREDICTOR HEADS
             Transition Head: aux_loss (SparseCodebookMoE), Sparsity Loss
             Loss weights: aux_loss, Sparsity_loss
         """
+        self.world_causal_alignment_loss_weight = self.causal_model.quantizer_params.CausalWorldContrastiveLossWeight
         self.predictor_params = config.Models.CausalModel.Predictors
         # self.loss_weights.update({
         #     'tr_aux_loss': self.predictor_params.Transition.AuxiliaryWeight,
@@ -575,7 +576,7 @@ class WorldModel(nn.Module):
             else:
                 tokens = self.sequence_model.backbone.tokenizer(latent, action)
                 quantizer_output, _ = self.causal_model(tokens, 1000, training=False)
-                feature_mask = self.causal_model.mask_generator(quantizer_output['quantized'])
+                feature_mask = self.causal_model.mask_generator(quantizer_output['quantized'], tokens)
                 tokens = tokens * feature_mask
                 dist_feat = self.sequence_model(tokens, inference_params)
 
@@ -794,7 +795,7 @@ class WorldModel(nn.Module):
             if not self.use_cg or not decoding:
                 tokens = self.sequence_model.backbone.tokenizer(samples, action)
                 quantizer_output, quant_loss = self.causal_model(tokens, global_step, training=False)
-                feature_mask = self.causal_model.mask_generator(quantizer_output['quantized'])
+                feature_mask = self.causal_model.mask_generator(quantizer_output['quantized'], tokens)
                 tokens = tokens * feature_mask
                 hidden_state = self.sequence_model(tokens, inference_params=inference_params)
                 # hidden_state = self.sequence_model(
@@ -821,8 +822,8 @@ class WorldModel(nn.Module):
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp and not self.use_cg):
             context_dist_feat = get_hidden_state(context_latent, sample_action, inference_params)
             inference_params.seqlen_offset += context_dist_feat.shape[1]
-            context_prior_logits = self.dist_head.forward_prior(context_dist_feat)
-            context_prior_sample = self.stright_throught_gradient(context_prior_logits)
+            context_prior_logits, _, _, _, _ = self.dist_head.forward_prior(context_dist_feat)
+            context_prior_sample = self.straight_through_gradient(context_prior_logits)
             context_flattened_sample = self.flatten_sample(context_prior_sample)
 
             dist_feat_list, sample_list = [context_dist_feat[:, -1:]], [context_flattened_sample[:, -1:]]
@@ -848,8 +849,8 @@ class WorldModel(nn.Module):
                 #     )
                 #     sampled_tokens = sample_tokens(logits, inference_params)
                 #     sequences_cat = torch.cat([sequences_cat, sampled_tokens], dim=1)
-                prior_logits = self.dist_head.forward_prior(dist_feat_list[-1])
-                prior_sample = self.stright_throught_gradient(prior_logits)
+                prior_logits, _, _, _, _ = self.dist_head.forward_prior(dist_feat_list[-1])
+                prior_sample = self.straight_through_gradient(prior_logits)
                 prior_flattened_sample = self.flatten_sample(prior_sample)
                 sample_list.append(prior_flattened_sample)
                 self.sample_buffer[:, i + 1:i + 2] = prior_flattened_sample
@@ -896,22 +897,22 @@ class WorldModel(nn.Module):
             obs_hat = self.image_decoder(flattened_sample)
 
             # dynamics core
-            if self.model == 'Transformer':
-                temporal_mask = get_subsequent_mask_with_batch_length(batch_length, flattened_sample.device)
-                dist_feat = self.sequence_model(flattened_sample, action, temporal_mask)
-            else:
-                # dist_feat = self.sequence_model(flattened_sample, action)
-                tokens = self.sequence_model.backbone.tokenizer(flattened_sample, action)
-                quantizer_output, quant_loss = self.causal_model(tokens, global_step, training=True)
-                feature_mask = self.causal_model.mask_generator(quantizer_output['quantized'])
-                tokens = tokens * feature_mask
-                dist_feat = self.sequence_model(tokens)
+            # if self.model == 'Transformer':
+            #     temporal_mask = get_subsequent_mask_with_batch_length(batch_length, flattened_sample.device)
+            #     dist_feat = self.sequence_model(flattened_sample, action, temporal_mask)
+            # else:
+            # dist_feat = self.sequence_model(flattened_sample, action)
+            tokens = self.sequence_model.backbone.tokenizer(flattened_sample, action)
+            quantizer_output, quant_loss = self.causal_model(tokens, global_step, training=True)
+            feature_mask = self.causal_model.mask_generator(quantizer_output['quantized'], tokens)
+            tokens = tokens * feature_mask
+            dist_feat = self.sequence_model(tokens)
 
             # Contrastive losses
-            code_contrastive_loss = self.causal_model.quantizer.info_nce_contrastive_loss(quantizer_output['quantized'])
+            code_contrastive_loss = quantizer_output['contrastive_loss']
             causal_world_contrastive_loss = self.world_causal_alignment_loss(dist_feat, quantizer_output['quantized'], temperature=0.1)
 
-            contrastive_loss = 0.3 * code_contrastive_loss
+            causal_world_loss = self.world_causal_alignment_loss_weight * causal_world_contrastive_loss
             # PREDICTION HEADS (with directed gradient flow)
             # For transition prediction - aloow gradients to modulator but not to causal model internals
             prior_logits, total_tr_loss, aux_loss, diversity_loss, sparsity_loss = self.dist_head.forward_prior(
@@ -935,11 +936,12 @@ class WorldModel(nn.Module):
             # decoding reward and termination with dist_feat
             reward_hat = self.reward_decoder(dist_feat)
             termination_hat = self.termination_decoder(dist_feat)
+            reward_decoded = self.symlog_twohot_loss_func.decode(reward_hat)  # Convert to scalar values
 
             """Model losses from causal model"""
             # env loss
             reconstruction_loss = self.mse_loss_func(obs_hat[:batch_size], obs[:batch_size])
-            reward_loss = F.mse_loss(reward_hat, symlog(reward))
+            reward_loss = F.mse_loss(reward_decoded, symlog(reward))
             termination_loss = self.bce_with_logits_loss_func(termination_hat, termination)
             # dyn-rep loss
             # pred_loss = (self.loss_weights['tr_aux_loss'] * aux_loss) + (
@@ -953,8 +955,8 @@ class WorldModel(nn.Module):
             # Added a dynamics loss weight 0.8
             prediction_head_loss = pred_loss
             world_model_loss = reconstruction_loss + reward_loss + termination_loss + dynamics_loss + \
-                               0.1 * representation_loss + prediction_head_loss + 0.4 * causal_world_contrastive_loss
-            causal_model_loss = quant_loss + contrastive_loss
+                               0.1 * representation_loss + prediction_head_loss + causal_world_loss
+            causal_model_loss = quant_loss + code_contrastive_loss
             # total_loss = reconstruction_loss + reward_loss + termination_loss + dynamics_loss + 0.1 * representation_loss + causal_loss + pred_loss + re_head_loss
 
             # First backward for world model
@@ -1007,7 +1009,7 @@ class WorldModel(nn.Module):
 
         return reconstruction_loss.item(), reward_loss.item(), termination_loss.item(), \
             dynamics_loss.item(), dynamics_real_kl_div.item(), representation_loss.item(), \
-            representation_real_kl_div.item(), quant_loss.item(), causal_model_loss.item(), world_model_loss.item()
+            representation_real_kl_div.item(), quant_loss.item(), code_contrastive_loss.item(), causal_world_loss.item(), causal_model_loss.item(), world_model_loss.item()
 
     def world_causal_alignment_loss(self, dist_feat, code_emb, temperature=0.1):
         """
@@ -1067,18 +1069,19 @@ class WorldModel(nn.Module):
         B, L, D = trajectory.shape
 
         # Calculate stride to evenly cover the trajectory
-        if self.stride is None:
-            if L <= self.window_size:
-                stride = 1
-            else:
-                stride = max(1, (L - self.window_size) // (self.num_windows - 1))
-        else:
-            stride = self.stride
+        # if self.stride is None:
+        #     if L <= self.window_size:
+        #         stride = 1
+        #     else:
+        #         stride = max(1, (L - self.window_size) // (self.num_windows - 1))
+        # else:
+        #     stride = self.stride
+        stride = max(1, (L - self.causal_model.window_size) // (self.causal_model.num_windows - 1))
 
         windows = []
-        for i in range(self.num_windows):
-            start_idx = min(i * stride, max(0, L - self.window_size))
-            windows.append(trajectory[:, start_idx:start_idx + self.window_size])
+        for i in range(self.causal_model.num_windows):
+            start_idx = min(i * stride, max(0, L - self.causal_model.window_size))
+            windows.append(trajectory[:, start_idx:start_idx + self.causal_model.window_size])
 
         # Stack along batch dimension to process as independent trajectories
         return torch.cat(windows, dim=0)  # [B*M, W, D]
