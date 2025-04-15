@@ -694,9 +694,9 @@ def capture_graph(
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
             for _ in range(n_warmups):
+                hidden_state = model.backbone.tokenizer(samples, action)
                 hidden_state = model(
-                    samples,
-                    action,
+                    hidden_state,
                     inference_params=inference_params,
                     num_last_tokens=decoding_seqlen,
                 )
@@ -711,8 +711,9 @@ def capture_graph(
         # To allow capture, automatically sets a side stream as the current stream in the context
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, pool=mempool):
+            hidden_state = model.backbone.tokenizer(samples, action)
             hidden_state = model(
-                samples, action,
+                hidden_state,
                 inference_params=inference_params,
                 num_last_tokens=decoding_seqlen,
             )
